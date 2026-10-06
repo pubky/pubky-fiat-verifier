@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Payment verifier gateway for Locks: speaks the Paykit Server wire contract, proxies BTC to the real Paykit Server, settles fiat criteria through processor plugins (Stripe test mode, PayPal sandbox)."
-repository = "https://github.com/BitcoinErrorLog/pubky-fiat-verifier"
+repository = "https://github.com/pubky/pubky-fiat-verifier"
 
 [dependencies]
 async-trait = "0.1"
