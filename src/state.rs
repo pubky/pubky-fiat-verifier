@@ -6,7 +6,11 @@
 //! | paid, inside settlement delay      | detected, 0, amount_matched                     |
 //! | paid, delay elapsed                | promotion due: fresh API re-pull decides        |
 //! | confirmed                          | confirmed, synthesized confirmations, true      |
-//! | reversed                           | undetected, 0, false (never promoted)           |
+//! | reversed (before or after confirm) | undetected, 0, false (never promoted)           |
+//!
+//! The status handler serves `confirmed` only after a fresh pull still shows
+//! the payment unrefunded and undisputed (see `http::transaction_status`);
+//! this mapping is the stored-state half of that decision.
 
 use std::time::Duration;
 

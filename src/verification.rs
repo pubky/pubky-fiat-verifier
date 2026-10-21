@@ -5,15 +5,17 @@
 //!
 //! Both processor plugins answer the same question — "does your read API say
 //! this correlation's session/order is paid, for exactly the criterion's
-//! amount?" — and dispatch happens on the processor the correlation was
-//! bound to when its session was minted.
+//! amount, and not refunded or disputed?" — and dispatch happens on the
+//! processor the correlation was bound to when its session was minted.
+//! A pull that finds a refund or a dispute reverses the row in any state,
+//! so reversal detection never depends on webhook delivery.
 
 use std::sync::Arc;
 
 use time::OffsetDateTime;
 
 use crate::paypal::{decimal_to_minor, PaypalProcessor};
-use crate::store::{Correlation, CorrelationState, CorrelationStore};
+use crate::store::{Correlation, CorrelationState, CorrelationStore, ReversalOutcome};
 use crate::stripe::StripeProcessor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,8 +93,43 @@ pub enum PullOutcome {
         amount_matched: bool,
     },
     Unpaid,
+    /// The processor reports the payment refunded (fully or partially) or
+    /// disputed; the row has been marked reversed.
+    Reversed,
     /// Transport or processor error: state must not move.
     Unavailable,
+}
+
+/// Records a verified reversal. A reversal after confirmation is logged as
+/// an alert: the Lock Server may already have released the good.
+pub async fn apply_reversal(
+    store: &Arc<dyn CorrelationStore>,
+    creator: &str,
+    bundle_id: &str,
+    processor: &str,
+    payment_reference: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<ReversalOutcome, crate::store::StoreError> {
+    let outcome = store.mark_reversed(creator, bundle_id, now).await?;
+    match outcome {
+        ReversalOutcome::Reversed => tracing::warn!(
+            creator,
+            bundle_id,
+            processor,
+            payment_reference,
+            "verified reversal recorded; promotion suppressed"
+        ),
+        ReversalOutcome::ReversedAfterConfirm => tracing::error!(
+            creator,
+            bundle_id,
+            processor,
+            payment_reference,
+            "ALERT fiat payment reversed after confirmation; entitlement may already be \
+             released, route to the marketplace dispute flow"
+        ),
+        ReversalOutcome::Unchanged => {}
+    }
+    Ok(outcome)
 }
 
 /// Pulls the correlation's session/order from its bound processor and
@@ -123,6 +160,24 @@ pub async fn pull_and_apply(
         } => (amount_matched, payment_reference),
         Pulled::Unpaid => return PullOutcome::Unpaid,
         Pulled::Unavailable => return PullOutcome::Unavailable,
+        Pulled::Reversed { payment_reference } => {
+            return match apply_reversal(
+                store,
+                &correlation.creator,
+                &correlation.bundle_id,
+                kind.as_str(),
+                payment_reference.as_deref(),
+                now,
+            )
+            .await
+            {
+                Ok(_) => PullOutcome::Reversed,
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist reversal");
+                    PullOutcome::Unavailable
+                }
+            };
+        }
     };
     if !amount_matched {
         tracing::error!(
@@ -167,6 +222,9 @@ enum Pulled {
         payment_reference: Option<String>,
     },
     Unpaid,
+    Reversed {
+        payment_reference: Option<String>,
+    },
     Unavailable,
 }
 
@@ -184,6 +242,42 @@ async fn pull_stripe(stripe: &StripeProcessor, correlation: &Correlation) -> Pul
     if session.payment_status.as_deref() != Some("paid") {
         return Pulled::Unpaid;
     }
+    // `payment_status` stays `paid` through refunds and disputes: only the
+    // charge shows them, so a paid session without a readable charge holds.
+    let Some(payment_intent_id) = session.payment_intent.as_deref() else {
+        tracing::warn!(session_id, "paid stripe session carries no payment intent");
+        return Pulled::Unavailable;
+    };
+    let intent = match stripe.retrieve_payment_intent(payment_intent_id).await {
+        Ok(intent) => intent,
+        Err(error) => {
+            tracing::warn!(%error, payment_intent_id, "stripe payment intent pull failed");
+            return Pulled::Unavailable;
+        }
+    };
+    let Some(charge) = intent.latest_charge else {
+        tracing::warn!(
+            payment_intent_id,
+            "paid stripe payment intent has no charge"
+        );
+        return Pulled::Unavailable;
+    };
+    if charge.is_reversed() {
+        tracing::warn!(
+            payment_intent_id,
+            charge_id = charge.id.as_deref(),
+            refunded = charge.refunded,
+            amount_refunded = charge.amount_refunded,
+            disputed = charge.disputed,
+            "stripe pull shows a refund or dispute"
+        );
+        return Pulled::Reversed {
+            payment_reference: Some(intent.id),
+        };
+    }
+    if charge.status.as_deref() != Some("succeeded") {
+        return Pulled::Unpaid;
+    }
     let amount_matched = session.amount_total == Some(correlation.amount_minor)
         && session
             .currency
@@ -191,7 +285,7 @@ async fn pull_stripe(stripe: &StripeProcessor, correlation: &Correlation) -> Pul
             .is_some_and(|currency| currency.eq_ignore_ascii_case(&correlation.asset));
     Pulled::Paid {
         amount_matched,
-        payment_reference: session.payment_intent,
+        payment_reference: Some(intent.id),
     }
 }
 
@@ -228,11 +322,43 @@ async fn pull_paypal(paypal: &PaypalProcessor, correlation: &Correlation) -> Pul
         }
         _ => return Pulled::Unpaid,
     };
+    if let Some(capture) = order.reversed_capture() {
+        tracing::warn!(
+            order_id,
+            capture_id = %capture.id,
+            capture_status = capture.status.as_deref(),
+            "paypal pull shows a refunded or reversed capture"
+        );
+        return Pulled::Reversed {
+            payment_reference: Some(capture.id.clone()),
+        };
+    }
     // Order COMPLETED alone is not payment: the capture object's own status
     // must be COMPLETED (design §3.3.3).
     let Some(capture) = order.completed_capture() else {
         return Pulled::Unpaid;
     };
+    // An open dispute leaves the capture COMPLETED; only the Disputes API
+    // shows it.
+    match paypal.disputes_for_capture(&capture.id).await {
+        Ok(disputes) => {
+            if let Some(dispute) = disputes.items.first() {
+                tracing::warn!(
+                    order_id,
+                    capture_id = %capture.id,
+                    dispute_id = %dispute.dispute_id,
+                    "paypal pull shows a dispute"
+                );
+                return Pulled::Reversed {
+                    payment_reference: Some(capture.id.clone()),
+                };
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, order_id, "paypal dispute lookup failed");
+            return Pulled::Unavailable;
+        }
+    }
     let amount_matched = capture.amount.as_ref().is_some_and(|amount| {
         amount
             .currency_code

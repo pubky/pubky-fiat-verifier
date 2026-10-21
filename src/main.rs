@@ -83,6 +83,10 @@ async fn main() {
             processors.clone(),
             config.poll_interval,
             config.settlement_delay,
+            worker::ReversalWatch {
+                window: config.reversal_watch_window,
+                recheck_interval: config.reversal_recheck_interval,
+            },
         ));
     }
 
@@ -124,6 +128,8 @@ async fn main() {
         default_processor = default_processor.as_str(),
         settlement_delay_seconds = config.settlement_delay.as_secs(),
         synthesized_confirmations = config.synthesized_confirmations,
+        reversal_watch_days = config.reversal_watch_window.as_secs() / 86_400,
+        reversal_recheck_seconds = config.reversal_recheck_interval.as_secs(),
         allowed_assets = ?config.allowed_assets,
         buyer_return_origins = config.buyer_return_origins.len(),
         "starting pubky-fiat-verifier"

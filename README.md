@@ -56,8 +56,8 @@ not a second backend: one URL, all rails. Cutover is an operator env change
 | `POST /invoices` | `X-Paykit-Signature` (pinned Lock Server key; canonical-JSON strict body) | Fetch the content lock from the creator's homeserver (public Pubky read), parse the `paykit-payment` criterion, dispatch by `asset`. BTC → proxy. Fiat → persist correlation, `204`; a hosted checkout is minted eagerly when exactly one processor is configured (see processor selection below). Exact replay → `204` (idempotent). Same identity, different binding → `409`. |
 | `POST /transactions/status` | same | Unknown or BTC correlation → proxy (the real Paykit Server owns every BTC invoice, including all pre-cutover ones). Fiat → answered from local state, advanced **only** by verified API pulls. |
 | `POST /checkout-sessions` | possession of `{creator, bundle_id}` (bearer material), rate-limited | Body `{creator, bundle_id, processor?, return_origin?}`. Returns `{checkout_url, processor, expires_at}`. Idempotent; re-mints on the **same** processor if the session expired. `404` unknown/BTC, `409` once paid, when `processor` names a different processor than the correlation is bound to, or when `return_origin` differs from the bound origin, `400` unknown processor value (`invalid_request`) or an origin off the allowlist (`invalid_return_origin`), `503` when the named processor is not configured. |
-| `POST /webhooks/stripe` | `Stripe-Signature` (HMAC over raw body, ±300s tolerance, deduped by event id) | A **hint, never a fact**: schedules an API pull. `checkout.session.completed` / `async_payment_succeeded` → pull the session. `charge.refunded` / `charge.dispute.created` → pull the charge, and only a corroborating pull marks the correlation reversed. |
-| `POST /webhooks/paypal` | PayPal transmission headers, verified via `POST /v1/notifications/verify-webhook-signature` over the exact raw body (requires `PAYPAL_WEBHOOK_ID`); deduped by event id | Same hint-only rule. `CHECKOUT.ORDER.APPROVED` / `CHECKOUT.ORDER.COMPLETED` / `PAYMENT.CAPTURE.COMPLETED` / `PENDING` → pull the order. `PAYMENT.CAPTURE.REFUNDED` / `REVERSED` / `DENIED` → pull the capture; `CUSTOMER.DISPUTE.CREATED` → pull the dispute; only a corroborating pull marks the correlation reversed. |
+| `POST /webhooks/stripe` | `Stripe-Signature` (HMAC over raw body, ±300s tolerance, deduped by event id) | A **hint, never a fact**: schedules an API pull. `checkout.session.completed` / `async_payment_succeeded` → pull the session. `charge.refunded` (object = the charge) / `charge.dispute.created` (object = the dispute, whose `charge` is pulled) → pull the charge, and only a corroborating pull marks the correlation reversed, in any state including `confirmed`. A transient failure (processor or database unavailable) answers `503` and releases the event id, so Stripe's retry is processed instead of deduplicated. |
+| `POST /webhooks/paypal` | PayPal transmission headers, verified via `POST /v1/notifications/verify-webhook-signature` over the exact raw body (requires `PAYPAL_WEBHOOK_ID`); deduped by event id | Same hint-only and transient-failure rules. `CHECKOUT.ORDER.APPROVED` / `CHECKOUT.ORDER.COMPLETED` / `PAYMENT.CAPTURE.COMPLETED` / `PENDING` → pull the order. `PAYMENT.CAPTURE.REFUNDED` / `REVERSED` / `DENIED` → pull the capture; `CUSTOMER.DISPUTE.CREATED` → pull the dispute (`GET /v1/customer/disputes/{id}`); only a corroborating pull marks the correlation reversed. |
 | `GET /health` | none | DB + processor wiring status (`stripe_enabled`, `stripe_webhook_configured`, `paypal_enabled`, `paypal_webhook_configured`, `default_processor`). |
 
 ### Processor selection
@@ -93,8 +93,33 @@ validity; the create response carries no expiry field).
 | --- | --- |
 | created (no completed checkout) | `undetected, 0, false` |
 | paid (API pull verified), inside settlement delay | `detected, 0, amount_matched` |
-| paid, delay elapsed, fresh re-pull still paid | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
-| reversed/disputed before completion (pull-verified) | `undetected, 0, false` — never promoted |
+| paid, delay elapsed, fresh re-pull still paid and not refunded or disputed | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| confirmed, fresh re-pull on every status read still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| confirmed, processor unreadable on that read | `detected, 0, true` (held, never served blind) |
+| reversed — refunded (fully or partially) or disputed, pull-verified, before or after confirmation | `undetected, 0, false` |
+
+**What "paid" means.** A Stripe Checkout Session keeps `payment_status: paid` after a
+refund or a dispute, so every Stripe pull also reads the session's PaymentIntent with
+`expand[]=latest_charge` and treats `refunded`, `amount_refunded > 0` or `disputed` as a
+reversal. A paid session whose charge cannot be read holds its state. On PayPal, a
+`REFUNDED` / `PARTIALLY_REFUNDED` / `REVERSED` capture is a reversal, and an open dispute
+(found through `GET /v1/customer/disputes?disputed_transaction_id=<capture>`, since it
+leaves the capture `COMPLETED`) is one too. Any dispute counts, whatever its outcome:
+the rule is deliberately fail-closed.
+
+**Reversal watch (missed webhooks).** Webhooks only speed reversal detection up. The poll
+worker re-pulls every confirmed correlation every `FIAT_REVERSAL_RECHECK_SECONDS` for
+`FIAT_REVERSAL_WATCH_DAYS` after confirmation, so a reversal whose webhook was lost,
+rejected or never configured is still recorded. A pull the processor could not answer is
+retried on the next poll tick.
+
+**Reversal after confirmation.** The row moves to `reversed` with
+`reversed_after_confirm = true` and the service logs an `ALERT fiat payment reversed
+after confirmation` error line. From then on the status endpoint stops reporting
+`confirmed`, so a Lock Server that has not completed the task yet never releases the good.
+Locks has no un-complete transition, so an entitlement the Lock Server already completed
+stays granted: that case goes to the marketplace dispute flow, and the alert is the
+operator's signal.
 
 There is no early-failure transition in the Locks contract: an abandoned checkout leaves
 the task pending until the marketplace payment window and task expiry lapse, exactly as
@@ -145,6 +170,8 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `BUYER_RETURN_ORIGINS` | no | empty | Comma-separated exact `https://` origins (scheme+host[+port] only — no path/query/fragment/userinfo; any invalid entry refuses to boot). Multi-shop mode: a `/checkout-sessions` request may name one as `return_origin`, and the success/cancel redirect URLs are then derived server-side as `{origin}/marketplace?checkout=return` and `{origin}/marketplace?checkout=cancel`. The origin is bound to the correlation at mint and never changes. |
 | `FIAT_CHECKOUT_SUCCESS_URL` / `FIAT_CHECKOUT_CANCEL_URL` | no | staging app URLs | **Legacy single-shop mode**: static redirect targets used when a checkout request carries no `return_origin` (or the allowlist is empty). Redirects are buyer-attested and carry no state; the Locks lifecycle is the only truth. |
 | `FIAT_POLL_INTERVAL_SECONDS` | no | `60` | Slow-poll interval over open fiat correlations (lost-webhook recovery). |
+| `FIAT_REVERSAL_WATCH_DAYS` | no | `180` | How long after confirmation the poll worker keeps re-checking for a refund or dispute (1–3650). The default covers PayPal's 180-day dispute window; Stripe card disputes arrive within 120 days. |
+| `FIAT_REVERSAL_RECHECK_SECONDS` | no | `3600` | Minimum time between two reversal checks of one confirmed payment. Each Stripe check costs two API reads (session and PaymentIntent), each PayPal check two (order and disputes). |
 | `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket for `/checkout-sessions`. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
 
@@ -232,13 +259,21 @@ state except a pull: grep for those two messages when auditing an entitlement.
 ## Development
 
 ```bash
-cargo test        # 80 tests: signature verification, dispatch, idempotency,
+cargo test        # signature verification, dispatch, idempotency,
                   # webhook-vs-pull disagreement (pull wins), delay window,
-                  # re-mint, reversal suppression, processor selection and
-                  # binding, PayPal lifecycle + capture-on-approval, buyer
-                  # return-origin allowlist + binding
+                  # re-mint, refund/dispute detection before and after
+                  # confirmation, reversal watch, webhook redelivery,
+                  # processor selection and binding, PayPal lifecycle +
+                  # capture-on-approval, buyer return-origin allowlist + binding
+FIAT_TEST_DATABASE_URL=postgres://user:pass@localhost/db cargo test
+                  # additionally runs the Postgres store tests against a real
+                  # database (they print a skip notice without it)
 cargo build --release
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings` and `cargo test` against a Postgres service on every push and pull
+request, on the same Rust version as the Dockerfile.
 
 Unit tests run against an in-memory store, mock Stripe and PayPal APIs, and a mock
 Paykit Server; Lock Server signatures in tests are real ed25519 over canonical JSON,
@@ -256,7 +291,9 @@ proof is pending sandbox credentials.
 - `confirmations` for fiat is synthesized to satisfy the existing satisfaction rule; the
   mechanism (the delay really elapsed) is honest, the unit is not.
 - Post-completion chargebacks land in the marketplace dispute flow (operator-manual in
-  this phase); Locks has no un-complete transition, deliberately.
+  this phase); Locks has no un-complete transition, deliberately. This service detects
+  them (webhook or reversal watch), records `reversed_after_confirm` and logs an
+  `ALERT` line, but cannot revoke an entitlement the Lock Server already completed.
 - Seller onboarding (Stripe Connect / PayPal Commerce Platform) is a later phase: this
   deployment settles into the operator-configured Stripe test / PayPal sandbox account,
   marked staging-only.
