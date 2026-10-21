@@ -33,6 +33,7 @@ use crate::store::memory::MemoryStore;
 use crate::store::{CorrelationState, CorrelationStore};
 use crate::stripe::StripeProcessor;
 use crate::verification::{ProcessorKind, Processors};
+use crate::worker::ReversalWatch;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
@@ -81,6 +82,8 @@ struct MockStripe {
     /// session id -> session object returned by retrieve.
     sessions: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     charges: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// When set, PaymentIntent reads answer 503 (processor outage).
+    payment_intents_unavailable: Arc<Mutex<bool>>,
     counter: Arc<Mutex<u32>>,
     /// Incremented when a create call ARRIVES (before any gate), so tests
     /// can wait for an in-flight mint without sleeps.
@@ -91,6 +94,8 @@ struct MockStripe {
 }
 
 impl MockStripe {
+    /// Marking a session paid also creates its PaymentIntent (`pi_<session>`)
+    /// and succeeded charge (`ch_<session>`), as Stripe does.
     fn set_payment_status(&self, session_id: &str, payment_status: &str) {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(session_id).unwrap();
@@ -98,7 +103,49 @@ impl MockStripe {
         if payment_status == "paid" {
             session["status"] = json!("complete");
             session["payment_intent"] = json!(format!("pi_{session_id}"));
+            let charge_id = format!("ch_{session_id}");
+            self.charges.lock().unwrap().insert(
+                charge_id.clone(),
+                json!({
+                    "id": charge_id,
+                    "object": "charge",
+                    "status": "succeeded",
+                    "amount": session["amount_total"].clone(),
+                    "amount_refunded": 0,
+                    "refunded": false,
+                    "disputed": false,
+                    "payment_intent": format!("pi_{session_id}"),
+                }),
+            );
         }
+    }
+
+    /// A refund of `amount` minor units against the session's charge. The
+    /// session itself keeps `payment_status: paid`, exactly like Stripe.
+    fn refund(&self, session_id: &str, amount: i64) {
+        let mut charges = self.charges.lock().unwrap();
+        let charge = charges.get_mut(&format!("ch_{session_id}")).unwrap();
+        let refunded = charge["amount_refunded"].as_i64().unwrap() + amount;
+        charge["amount_refunded"] = json!(refunded);
+        charge["refunded"] = json!(Some(refunded) == charge["amount"].as_i64());
+    }
+
+    /// A dispute (chargeback) against the session's charge; returns the
+    /// dispute object Stripe would put in a `charge.dispute.created` event.
+    fn dispute(&self, session_id: &str) -> Value {
+        let charge_id = format!("ch_{session_id}");
+        self.charges.lock().unwrap().get_mut(&charge_id).unwrap()["disputed"] = json!(true);
+        json!({
+            "id": format!("dp_{session_id}"),
+            "object": "dispute",
+            "charge": charge_id,
+            "payment_intent": format!("pi_{session_id}"),
+            "status": "needs_response",
+        })
+    }
+
+    fn fail_payment_intent_reads(&self, fail: bool) {
+        *self.payment_intents_unavailable.lock().unwrap() = fail;
     }
 }
 
@@ -172,6 +219,48 @@ async fn mock_get_session(
     }
 }
 
+/// `GET /v1/payment_intents/:id`. Like Stripe, `latest_charge` is only the
+/// charge id unless the request asks for `expand[]=latest_charge`.
+async fn mock_get_payment_intent(
+    State(mock): State<MockStripe>,
+    Path(id): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    if *mock.payment_intents_unavailable.lock().unwrap() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"type": "api_error"}})),
+        )
+            .into_response();
+    }
+    let Some(session_id) = id.strip_prefix("pi_") else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": {"type": "invalid_request_error"}})),
+        )
+            .into_response();
+    };
+    let charge_id = format!("ch_{session_id}");
+    let Some(charge) = mock.charges.lock().unwrap().get(&charge_id).cloned() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": {"type": "invalid_request_error"}})),
+        )
+            .into_response();
+    };
+    let expanded = query
+        .unwrap_or_default()
+        .split('&')
+        .any(|pair| pair == "expand%5B%5D=latest_charge" || pair == "expand[]=latest_charge");
+    Json(json!({
+        "id": id,
+        "object": "payment_intent",
+        "status": "succeeded",
+        "latest_charge": if expanded { charge } else { json!(charge_id) },
+    }))
+    .into_response()
+}
+
 async fn mock_get_charge(
     State(mock): State<MockStripe>,
     Path(id): Path<String>,
@@ -213,8 +302,10 @@ struct MockPaypal {
     orders: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     /// capture id -> capture object (GET /v2/payments/captures/:id).
     captures: Arc<Mutex<std::collections::HashMap<String, Value>>>,
-    /// dispute id -> dispute object (GET /v1/customer-disputes/:id).
+    /// dispute id -> dispute object (GET /v1/customer/disputes/:id).
     disputes: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// When set, the dispute list answers 503 (processor outage).
+    disputes_unavailable: Arc<Mutex<bool>>,
     capture_calls: Arc<Mutex<u32>>,
     counter: Arc<Mutex<u32>>,
     /// Incremented when a create-order call ARRIVES (before any gate).
@@ -263,8 +354,12 @@ impl MockPaypal {
         captures.get_mut(&capture_id).unwrap()["amount"]["value"] = json!(value);
     }
 
+    /// Changes the capture's status everywhere PayPal reports it: the
+    /// standalone capture and the copy embedded in the order.
     fn set_capture_status(&self, order_id: &str, status: &str) {
         let capture_id = format!("ppcap_{order_id}");
+        self.orders.lock().unwrap().get_mut(order_id).unwrap()["purchase_units"][0]["payments"]
+            ["captures"][0]["status"] = json!(status);
         let mut captures = self.captures.lock().unwrap();
         captures.get_mut(&capture_id).unwrap()["status"] = json!(status);
     }
@@ -427,6 +522,45 @@ async fn mock_paypal_get_dispute(
     }
 }
 
+/// `GET /v1/customer/disputes?disputed_transaction_id=...`: summaries of
+/// the disputes naming that capture.
+async fn mock_paypal_list_disputes(
+    State(mock): State<MockPaypal>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if *mock.disputes_unavailable.lock().unwrap() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"name": "INTERNAL_SERVICE_ERROR"})),
+        )
+            .into_response();
+    }
+    let Some(capture_id) = query.get("disputed_transaction_id") else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"name": "INVALID_REQUEST"})),
+        )
+            .into_response();
+    };
+    let items: Vec<Value> = mock
+        .disputes
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|dispute| {
+            dispute["disputed_transactions"]
+                .as_array()
+                .is_some_and(|transactions| {
+                    transactions
+                        .iter()
+                        .any(|t| t["seller_transaction_id"] == json!(capture_id))
+                })
+        })
+        .map(|dispute| json!({"dispute_id": dispute["dispute_id"], "status": dispute["status"]}))
+        .collect();
+    Json(json!({"items": items, "links": []})).into_response()
+}
+
 /// Really verifies: recomputes the mock transmission signature from the
 /// postback's own fields and the exact bytes of the forwarded event.
 async fn mock_paypal_verify_webhook(body: Bytes) -> axum::response::Response {
@@ -505,6 +639,8 @@ async fn mock_paykit_status(
 struct Harness {
     base: String,
     store: Arc<dyn CorrelationStore>,
+    memory: Arc<MemoryStore>,
+    processors: Arc<Processors>,
     stripe_mock: MockStripe,
     paypal_mock: MockPaypal,
     paykit_mock: MockPaykit,
@@ -547,6 +683,7 @@ async fn build_harness(options: HarnessOptions) -> Harness {
             .route("/v1/checkout/sessions", post(mock_create_session))
             .route("/v1/checkout/sessions/{id}", get(mock_get_session))
             .route("/v1/charges/{id}", get(mock_get_charge))
+            .route("/v1/payment_intents/{id}", get(mock_get_payment_intent))
             .with_state(stripe_mock.clone()),
     )
     .await;
@@ -562,7 +699,8 @@ async fn build_harness(options: HarnessOptions) -> Harness {
                 post(mock_paypal_capture_order),
             )
             .route("/v2/payments/captures/{id}", get(mock_paypal_get_capture))
-            .route("/v1/customer-disputes/{id}", get(mock_paypal_get_dispute))
+            .route("/v1/customer/disputes", get(mock_paypal_list_disputes))
+            .route("/v1/customer/disputes/{id}", get(mock_paypal_get_dispute))
             .route(
                 "/v1/notifications/verify-webhook-signature",
                 post(mock_paypal_verify_webhook),
@@ -616,7 +754,8 @@ async fn build_harness(options: HarnessOptions) -> Harness {
         },
     );
 
-    let store: Arc<dyn CorrelationStore> = Arc::new(MemoryStore::default());
+    let memory = Arc::new(MemoryStore::default());
+    let store: Arc<dyn CorrelationStore> = memory.clone();
     let processors = Arc::new(Processors {
         stripe: options.with_stripe.then(|| {
             Arc::new(StripeProcessor::new(
@@ -642,7 +781,7 @@ async fn build_harness(options: HarnessOptions) -> Harness {
     let state = Arc::new(AppState {
         trusted_key: locks_key().verifying_key(),
         store: store.clone(),
-        processors,
+        processors: processors.clone(),
         default_processor,
         criterion_source: Arc::new(StaticCriteria(Mutex::new(criteria))),
         proxy: Arc::new(PaykitProxy::new(url::Url::parse(&paykit_url).unwrap())),
@@ -658,6 +797,8 @@ async fn build_harness(options: HarnessOptions) -> Harness {
     Harness {
         base,
         store,
+        memory,
+        processors,
         stripe_mock,
         paypal_mock,
         paykit_mock,
@@ -698,7 +839,34 @@ async fn harness_dual(settlement_delay: Duration) -> Harness {
     .await
 }
 
+/// The reversal watch the worker tests run with.
+const WATCH: ReversalWatch = ReversalWatch {
+    window: Duration::from_secs(180 * 86_400),
+    recheck_interval: Duration::from_secs(3600),
+};
+
 impl Harness {
+    /// One poll-worker pass at `now`.
+    async fn tick(&self, now: OffsetDateTime) {
+        crate::worker::tick(
+            &self.store,
+            &self.processors,
+            self.settlement_delay,
+            WATCH,
+            now,
+        )
+        .await;
+    }
+
+    async fn state(&self, bundle: &str) -> CorrelationState {
+        self.store
+            .get(CREATOR, bundle)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
     async fn signed_post(&self, path: &str, body: &[u8]) -> reqwest::Response {
         self.http
             .post(format!("{}{path}", self.base))
@@ -1051,10 +1219,10 @@ async fn detection_works_without_webhooks_via_status_poll() {
 async fn amount_mismatch_is_reported_and_never_promotes() {
     let harness = harness_with_delay(Duration::from_secs(0)).await;
     assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
     {
         let mut sessions = harness.stripe_mock.sessions.lock().unwrap();
         let session = sessions.get_mut("cs_test_1").unwrap();
-        session["payment_status"] = json!("paid");
         session["amount_total"] = json!(1); // paid the wrong amount
     }
     let status = harness.status(BUNDLE).await;
@@ -2132,4 +2300,290 @@ async fn no_origin_refetch_on_bound_correlation_returns_the_bound_session() {
     assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 2);
     let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
     assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+}
+
+// -- reversal hardening ---------------------------------------------------------
+
+/// Invoice, pay, detect and confirm a Stripe purchase through the poll
+/// worker alone (no webhooks); returns the confirmation time.
+async fn confirm_stripe_purchase(harness: &Harness) -> OffsetDateTime {
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    let paid_at = OffsetDateTime::now_utc();
+    harness.tick(paid_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+    let confirmed_at = paid_at + harness.settlement_delay;
+    harness.tick(confirmed_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+    confirmed_at
+}
+
+/// Same through PayPal.
+async fn confirm_paypal_purchase(harness: &Harness) -> OffsetDateTime {
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let paid_at = OffsetDateTime::now_utc();
+    harness.tick(paid_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+    let confirmed_at = paid_at + harness.settlement_delay;
+    harness.tick(confirmed_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+    confirmed_at
+}
+
+#[tokio::test]
+async fn refund_inside_settlement_delay_blocks_confirmation_without_a_webhook() {
+    let harness = harness_with_delay(Duration::from_secs(1)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    assert_eq!(harness.status(BUNDLE).await["status"], "detected");
+
+    // Full refund; the session still says `paid` and no webhook arrives.
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    tokio::time::sleep(harness.settlement_delay + Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "undetected", "confirmations": 0, "amount_matched": false})
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(!harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+}
+
+#[tokio::test]
+async fn partial_refund_blocks_worker_promotion() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    let paid_at = OffsetDateTime::now_utc();
+    harness.tick(paid_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+
+    harness.stripe_mock.refund("cs_test_1", 500);
+    harness.tick(paid_at + harness.settlement_delay).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+}
+
+#[tokio::test]
+async fn dispute_before_detection_never_marks_paid() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    harness.stripe_mock.dispute("cs_test_1");
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+}
+
+#[tokio::test]
+async fn confirmed_status_is_rechecked_and_a_later_refund_withdraws_it() {
+    let harness = harness().await;
+    confirm_stripe_purchase(&harness).await;
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "confirmed", "confirmations": 1, "amount_matched": true})
+    );
+
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "undetected", "confirmations": 0, "amount_matched": false})
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    let meta = harness.memory.meta(CREATOR, BUNDLE);
+    assert!(meta.reversed_after_confirm);
+    assert!(meta.reversed_at.is_some());
+}
+
+#[tokio::test]
+async fn confirmed_status_holds_at_detected_while_stripe_is_unreadable() {
+    let harness = harness().await;
+    confirm_stripe_purchase(&harness).await;
+    harness.stripe_mock.fail_payment_intent_reads(true);
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "detected", "confirmations": 0, "amount_matched": true})
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+    harness.stripe_mock.fail_payment_intent_reads(false);
+    assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
+}
+
+#[tokio::test]
+async fn worker_reconciles_a_dispute_after_confirm_whose_webhook_was_lost() {
+    let harness = harness().await;
+    let confirmed_at = confirm_stripe_purchase(&harness).await;
+    harness.stripe_mock.dispute("cs_test_1");
+
+    // The confirming pull counts as the first check; the next one is due a
+    // recheck interval later.
+    harness.tick(confirmed_at + WATCH.recheck_interval).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+}
+
+#[tokio::test]
+async fn reversal_watch_respects_the_recheck_interval() {
+    let harness = harness().await;
+    let confirmed_at = confirm_stripe_purchase(&harness).await;
+    let checked_at = harness.memory.meta(CREATOR, BUNDLE).reversal_checked_at;
+    assert_eq!(checked_at, Some(confirmed_at));
+
+    // Refunded later; a pass inside the recheck interval leaves the row.
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    harness.tick(confirmed_at + Duration::from_secs(60)).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+
+    // The next pass after the interval finds the refund.
+    harness.tick(confirmed_at + WATCH.recheck_interval).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+}
+
+#[tokio::test]
+async fn reversal_watch_stops_after_the_window() {
+    let harness = harness().await;
+    let confirmed_at = confirm_stripe_purchase(&harness).await;
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    harness
+        .tick(confirmed_at + WATCH.window + Duration::from_secs(1))
+        .await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+    assert_eq!(
+        harness.memory.meta(CREATOR, BUNDLE).reversal_checked_at,
+        Some(confirmed_at)
+    );
+}
+
+#[tokio::test]
+async fn reversal_watch_retries_a_row_the_processor_could_not_answer() {
+    let harness = harness().await;
+    let confirmed_at = confirm_stripe_purchase(&harness).await;
+    harness.stripe_mock.fail_payment_intent_reads(true);
+    let due = confirmed_at + WATCH.recheck_interval;
+    harness.tick(due).await;
+    assert_eq!(
+        harness.memory.meta(CREATOR, BUNDLE).reversal_checked_at,
+        Some(confirmed_at),
+        "an unanswered check is not recorded"
+    );
+
+    // The very next pass retries, without waiting another interval.
+    harness.stripe_mock.fail_payment_intent_reads(false);
+    harness.stripe_mock.dispute("cs_test_1");
+    harness.tick(due + Duration::from_secs(60)).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+}
+
+#[tokio::test]
+async fn refund_webhook_after_confirm_reverses_the_row() {
+    let harness = harness().await;
+    confirm_stripe_purchase(&harness).await;
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    let event = json!({
+        "id": "evt_refund_after_confirm",
+        "type": "charge.refunded",
+        "data": {"object": {"id": "ch_cs_test_1", "object": "charge"}}
+    });
+    assert_eq!(harness.send_webhook(&event).await.status().as_u16(), 200);
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+}
+
+#[tokio::test]
+async fn dispute_webhook_resolves_the_charge_from_the_dispute_object() {
+    let harness = harness_with_delay(Duration::from_secs(600)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    assert_eq!(harness.status(BUNDLE).await["status"], "detected");
+
+    let dispute = harness.stripe_mock.dispute("cs_test_1");
+    let event = json!({
+        "id": "evt_dispute_1",
+        "type": "charge.dispute.created",
+        "data": {"object": dispute}
+    });
+    assert_eq!(harness.send_webhook(&event).await.status().as_u16(), 200);
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(!harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+}
+
+#[tokio::test]
+async fn reversal_webhook_that_fails_transiently_is_processed_on_redelivery() {
+    let harness = harness_with_delay(Duration::from_secs(600)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    assert_eq!(harness.status(BUNDLE).await["status"], "detected");
+
+    // The charge pull fails (Stripe answers 404 for a charge it has not
+    // propagated yet): 503, and the event id is released.
+    let event = json!({
+        "id": "evt_refund_retry",
+        "type": "charge.refunded",
+        "data": {"object": {"id": "ch_late", "object": "charge"}}
+    });
+    assert_eq!(harness.send_webhook(&event).await.status().as_u16(), 503);
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+
+    harness.stripe_mock.charges.lock().unwrap().insert(
+        "ch_late".into(),
+        json!({"id": "ch_late", "status": "succeeded", "refunded": true,
+               "amount_refunded": 1999, "disputed": false,
+               "payment_intent": "pi_cs_test_1"}),
+    );
+    let redelivery = harness.send_webhook(&event).await;
+    assert_eq!(redelivery.status().as_u16(), 200);
+    let body: Value = redelivery.json().await.unwrap();
+    assert_eq!(body, json!({"received": true}));
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+
+    // Once processed, the id deduplicates as before.
+    let again: Value = harness.send_webhook(&event).await.json().await.unwrap();
+    assert_eq!(again, json!({"received": true, "duplicate": true}));
+}
+
+#[tokio::test]
+async fn paypal_refund_after_confirm_is_reconciled_without_a_webhook() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    let confirmed_at = confirm_paypal_purchase(&harness).await;
+    assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
+
+    harness
+        .paypal_mock
+        .set_capture_status("pporder_1", "PARTIALLY_REFUNDED");
+    harness.tick(confirmed_at + WATCH.recheck_interval).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+    assert!(harness.memory.meta(CREATOR, BUNDLE).reversed_after_confirm);
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+}
+
+#[tokio::test]
+async fn paypal_dispute_is_found_by_the_pull_before_confirmation() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let paid_at = OffsetDateTime::now_utc();
+    harness.tick(paid_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+
+    // An open dispute leaves the capture COMPLETED; no webhook arrives.
+    harness.paypal_mock.set_dispute("PP-D-9", "ppcap_pporder_1");
+    harness.tick(paid_at + harness.settlement_delay).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+}
+
+#[tokio::test]
+async fn paypal_dispute_lookup_outage_holds_confirmation() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let paid_at = OffsetDateTime::now_utc();
+    harness.tick(paid_at).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+
+    *harness.paypal_mock.disputes_unavailable.lock().unwrap() = true;
+    harness.tick(paid_at + harness.settlement_delay).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
+
+    *harness.paypal_mock.disputes_unavailable.lock().unwrap() = false;
+    harness.tick(paid_at + harness.settlement_delay).await;
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
 }

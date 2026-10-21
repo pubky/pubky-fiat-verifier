@@ -50,13 +50,42 @@ pub struct CheckoutSession {
     pub payment_intent: Option<String>,
 }
 
+/// The Charge fields the verifier consumes
+/// (<https://docs.stripe.com/api/charges/object>).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Charge {
+    pub id: Option<String>,
+    /// `succeeded` | `pending` | `failed`. A refunded or disputed charge
+    /// stays `succeeded`, so this alone never shows a reversal.
+    pub status: Option<String>,
+    /// True only once the charge is fully refunded.
     #[serde(default)]
     pub refunded: bool,
     #[serde(default)]
+    pub amount_refunded: i64,
+    /// True once any dispute was opened, whatever its outcome.
+    #[serde(default)]
     pub disputed: bool,
     pub payment_intent: Option<String>,
+}
+
+impl Charge {
+    /// Any refund (full or partial) or any dispute. Deliberately strict: a
+    /// partially refunded or disputed payment never releases, and one that
+    /// already released is flagged for the operator.
+    pub fn is_reversed(&self) -> bool {
+        self.refunded || self.amount_refunded > 0 || self.disputed
+    }
+}
+
+/// A PaymentIntent retrieved with `expand[]=latest_charge`
+/// (<https://docs.stripe.com/api/payment_intents/object>). The Checkout
+/// Session's `payment_status` stays `paid` after a refund or a dispute, so
+/// the latest charge is where a reversal becomes visible.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PaymentIntent {
+    pub id: String,
+    pub latest_charge: Option<Charge>,
 }
 
 pub struct StripeProcessor {
@@ -126,6 +155,20 @@ impl StripeProcessor {
         let response = self
             .http
             .get(self.endpoint(&format!("/v1/checkout/sessions/{session_id}")))
+            .bearer_auth(&self.secret_key)
+            .send()
+            .await?;
+        Self::parse(response).await
+    }
+
+    pub async fn retrieve_payment_intent(
+        &self,
+        payment_intent_id: &str,
+    ) -> Result<PaymentIntent, StripeError> {
+        let response = self
+            .http
+            .get(self.endpoint(&format!("/v1/payment_intents/{payment_intent_id}")))
+            .query(&[("expand[]", "latest_charge")])
             .bearer_auth(&self.secret_key)
             .send()
             .await?;
@@ -316,6 +359,60 @@ mod tests {
             ),
             Err(WebhookError::MalformedHeader)
         );
+    }
+
+    fn charge(refunded: bool, amount_refunded: i64, disputed: bool) -> Charge {
+        serde_json::from_value(serde_json::json!({
+            "id": "ch_1",
+            "status": "succeeded",
+            "refunded": refunded,
+            "amount_refunded": amount_refunded,
+            "disputed": disputed,
+            "payment_intent": "pi_1",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn any_refund_or_dispute_is_a_reversal() {
+        assert!(!charge(false, 0, false).is_reversed());
+        assert!(charge(true, 1999, false).is_reversed());
+        assert!(charge(false, 1, false).is_reversed());
+        assert!(charge(false, 0, true).is_reversed());
+    }
+
+    #[test]
+    fn payment_intent_parses_the_expanded_latest_charge() {
+        let intent: PaymentIntent = serde_json::from_value(serde_json::json!({
+            "id": "pi_1",
+            "object": "payment_intent",
+            "status": "succeeded",
+            "latest_charge": {
+                "id": "ch_1",
+                "object": "charge",
+                "status": "succeeded",
+                "refunded": false,
+                "amount_refunded": 500,
+                "disputed": false,
+                "payment_intent": "pi_1"
+            }
+        }))
+        .unwrap();
+        let latest = intent.latest_charge.unwrap();
+        assert_eq!(latest.amount_refunded, 500);
+        assert!(latest.is_reversed());
+    }
+
+    #[test]
+    fn unexpanded_latest_charge_is_a_shape_error() {
+        // Without the expansion Stripe returns the charge id as a string;
+        // the pull must fail (and hold state) rather than read "no charge".
+        let parsed = serde_json::from_value::<PaymentIntent>(serde_json::json!({
+            "id": "pi_1",
+            "status": "succeeded",
+            "latest_charge": "ch_1"
+        }));
+        assert!(parsed.is_err());
     }
 
     #[test]

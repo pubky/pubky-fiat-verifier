@@ -1,8 +1,11 @@
 //! Correlation persistence. One row per (creator, bundle_id) — the invoice
 //! identity the Lock Server polls with. State transitions are monotonic:
 //! created -> paid -> confirmed, with reversed as a terminal branch reachable
-//! from created/paid (never from confirmed; a post-completion reversal is a
-//! marketplace dispute matter, not a Locks transition — design §5).
+//! from all three. A reversal of a confirmed row is recorded as
+//! `reversed_after_confirm`: Locks has no un-complete transition, so an
+//! entitlement the Lock Server already completed stays granted and the
+//! reversal becomes a marketplace dispute matter (design §5), but this
+//! gateway stops reporting `confirmed` for it from then on.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -77,6 +80,18 @@ pub enum InsertOutcome {
     Conflict,
 }
 
+/// What a verified reversal did to the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReversalOutcome {
+    /// created/paid -> reversed: promotion is suppressed.
+    Reversed,
+    /// confirmed -> reversed: the Lock Server may already have completed
+    /// the task; the operator must handle it in the dispute flow.
+    ReversedAfterConfirm,
+    /// Already reversed, or no such row.
+    Unchanged,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("correlation store error: {0}")]
 pub struct StoreError(pub String);
@@ -119,15 +134,21 @@ pub trait CorrelationStore: Send + Sync {
         paid_at: OffsetDateTime,
     ) -> Result<(), StoreError>;
     /// Promotes paid -> confirmed. No-op unless current state is `paid`.
+    /// Promotion only follows a fresh pull, so it also counts as the first
+    /// reversal check.
     async fn mark_confirmed(
         &self,
         creator: &str,
         bundle_id: &str,
         confirmed_at: OffsetDateTime,
     ) -> Result<(), StoreError>;
-    /// Marks created/paid -> reversed (verified reversal). Never touches
-    /// `confirmed` rows.
-    async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError>;
+    /// Marks created/paid/confirmed -> reversed (verified reversal only).
+    async fn mark_reversed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        reversed_at: OffsetDateTime,
+    ) -> Result<ReversalOutcome, StoreError>;
     async fn find_by_payment_intent(
         &self,
         payment_intent: &str,
@@ -138,9 +159,26 @@ pub trait CorrelationStore: Send + Sync {
         event_id: &str,
         event_type: &str,
     ) -> Result<bool, StoreError>;
+    /// Drops a recorded event id after its processing failed transiently,
+    /// so the processor's redelivery is processed instead of deduplicated.
+    async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError>;
     /// Fiat correlations with a session that still need observation
     /// (state `created` or `paid`), for the slow-poll worker.
     async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError>;
+    /// Confirmed correlations still inside the reversal watch window
+    /// (`confirmed_at >= confirmed_after`) whose last reversal check is
+    /// missing or older than `checked_before`, least recently checked first.
+    async fn confirmed_due_for_reversal_check(
+        &self,
+        confirmed_after: OffsetDateTime,
+        checked_before: OffsetDateTime,
+    ) -> Result<Vec<Correlation>, StoreError>;
+    async fn mark_reversal_checked(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), StoreError>;
     async fn healthy(&self) -> bool;
 }
 
@@ -177,10 +215,15 @@ CREATE TABLE IF NOT EXISTS correlations (
 );
 ALTER TABLE correlations ADD COLUMN IF NOT EXISTS processor TEXT;
 ALTER TABLE correlations ADD COLUMN IF NOT EXISTS return_origin TEXT;
+ALTER TABLE correlations ADD COLUMN IF NOT EXISTS reversed_at TIMESTAMPTZ;
+ALTER TABLE correlations ADD COLUMN IF NOT EXISTS reversed_after_confirm BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE correlations ADD COLUMN IF NOT EXISTS reversal_checked_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS correlations_payment_intent_idx
     ON correlations (payment_intent) WHERE payment_intent IS NOT NULL;
 CREATE INDEX IF NOT EXISTS correlations_open_idx
     ON correlations (state) WHERE state IN ('created', 'paid');
+CREATE INDEX IF NOT EXISTS correlations_reversal_watch_idx
+    ON correlations (reversal_checked_at NULLS FIRST, confirmed_at) WHERE state = 'confirmed';
 CREATE TABLE IF NOT EXISTS webhook_events (
     event_id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,
@@ -348,7 +391,8 @@ impl CorrelationStore for PostgresStore {
         confirmed_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "UPDATE correlations SET state = 'confirmed', confirmed_at = $3, updated_at = now() \
+            "UPDATE correlations SET state = 'confirmed', confirmed_at = $3, \
+             reversal_checked_at = $3, updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2 AND state = 'paid'",
         )
         .bind(creator)
@@ -360,17 +404,41 @@ impl CorrelationStore for PostgresStore {
         Ok(())
     }
 
-    async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE correlations SET state = 'reversed', updated_at = now() \
-             WHERE creator = $1 AND bundle_id = $2 AND state IN ('created', 'paid')",
+    async fn mark_reversed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        reversed_at: OffsetDateTime,
+    ) -> Result<ReversalOutcome, StoreError> {
+        use sqlx::Row;
+        // SET expressions read the pre-update row, so `state = 'confirmed'`
+        // records whether this reversal landed after confirmation.
+        let row = sqlx::query(
+            "UPDATE correlations SET state = 'reversed', reversed_at = $3, \
+             reversed_after_confirm = (state = 'confirmed'), updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2 \
+             AND state IN ('created', 'paid', 'confirmed') \
+             RETURNING reversed_after_confirm",
         )
         .bind(creator)
         .bind(bundle_id)
-        .execute(&self.pool)
+        .bind(reversed_at)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(match row {
+            None => ReversalOutcome::Unchanged,
+            Some(row) => {
+                if row
+                    .try_get::<bool, _>("reversed_after_confirm")
+                    .map_err(db_err)?
+                {
+                    ReversalOutcome::ReversedAfterConfirm
+                } else {
+                    ReversalOutcome::Reversed
+                }
+            }
+        })
     }
 
     async fn find_by_payment_intent(
@@ -404,6 +472,15 @@ impl CorrelationStore for PostgresStore {
         Ok(inserted.rows_affected() == 1)
     }
 
+    async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM webhook_events WHERE event_id = $1")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
         let rows = sqlx::query(&format!(
             "SELECT {SELECT_COLUMNS} FROM correlations \
@@ -414,6 +491,44 @@ impl CorrelationStore for PostgresStore {
         .await
         .map_err(db_err)?;
         rows.into_iter().map(row_to_correlation).collect()
+    }
+
+    async fn confirmed_due_for_reversal_check(
+        &self,
+        confirmed_after: OffsetDateTime,
+        checked_before: OffsetDateTime,
+    ) -> Result<Vec<Correlation>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM correlations \
+             WHERE state = 'confirmed' AND session_id IS NOT NULL AND confirmed_at >= $1 \
+             AND (reversal_checked_at IS NULL OR reversal_checked_at <= $2) \
+             ORDER BY reversal_checked_at ASC NULLS FIRST, confirmed_at ASC LIMIT 200"
+        ))
+        .bind(confirmed_after)
+        .bind(checked_before)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(row_to_correlation).collect()
+    }
+
+    async fn mark_reversal_checked(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET reversal_checked_at = $3 \
+             WHERE creator = $1 AND bundle_id = $2 AND state = 'confirmed'",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(checked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn healthy(&self) -> bool {
@@ -432,10 +547,31 @@ pub mod memory {
 
     use super::*;
 
+    /// Columns the Postgres store keeps outside `Correlation`.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct RowMeta {
+        pub confirmed_at: Option<OffsetDateTime>,
+        pub reversed_at: Option<OffsetDateTime>,
+        pub reversed_after_confirm: bool,
+        pub reversal_checked_at: Option<OffsetDateTime>,
+    }
+
     #[derive(Default)]
     pub struct MemoryStore {
         rows: Mutex<HashMap<(String, String), Correlation>>,
+        meta: Mutex<HashMap<(String, String), RowMeta>>,
         events: Mutex<HashSet<String>>,
+    }
+
+    impl MemoryStore {
+        pub fn meta(&self, creator: &str, bundle_id: &str) -> RowMeta {
+            self.meta
+                .lock()
+                .unwrap()
+                .get(&(creator.to_owned(), bundle_id.to_owned()))
+                .copied()
+                .unwrap_or_default()
+        }
     }
 
     #[async_trait]
@@ -551,28 +687,48 @@ pub mod memory {
             &self,
             creator: &str,
             bundle_id: &str,
-            _confirmed_at: OffsetDateTime,
+            confirmed_at: OffsetDateTime,
         ) -> Result<(), StoreError> {
+            let key = (creator.to_owned(), bundle_id.to_owned());
             let mut rows = self.rows.lock().unwrap();
-            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+            if let Some(row) = rows.get_mut(&key) {
                 if row.state == CorrelationState::Paid {
                     row.state = CorrelationState::Confirmed;
+                    let mut meta = self.meta.lock().unwrap();
+                    let meta = meta.entry(key).or_default();
+                    meta.confirmed_at = Some(confirmed_at);
+                    meta.reversal_checked_at = Some(confirmed_at);
                 }
             }
             Ok(())
         }
 
-        async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError> {
+        async fn mark_reversed(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            reversed_at: OffsetDateTime,
+        ) -> Result<ReversalOutcome, StoreError> {
+            let key = (creator.to_owned(), bundle_id.to_owned());
             let mut rows = self.rows.lock().unwrap();
-            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
-                if matches!(
-                    row.state,
-                    CorrelationState::Created | CorrelationState::Paid
-                ) {
-                    row.state = CorrelationState::Reversed;
-                }
-            }
-            Ok(())
+            let Some(row) = rows.get_mut(&key) else {
+                return Ok(ReversalOutcome::Unchanged);
+            };
+            let after_confirm = match row.state {
+                CorrelationState::Created | CorrelationState::Paid => false,
+                CorrelationState::Confirmed => true,
+                CorrelationState::Reversed => return Ok(ReversalOutcome::Unchanged),
+            };
+            row.state = CorrelationState::Reversed;
+            let mut meta = self.meta.lock().unwrap();
+            let meta = meta.entry(key).or_default();
+            meta.reversed_at = Some(reversed_at);
+            meta.reversed_after_confirm = after_confirm;
+            Ok(if after_confirm {
+                ReversalOutcome::ReversedAfterConfirm
+            } else {
+                ReversalOutcome::Reversed
+            })
         }
 
         async fn find_by_payment_intent(
@@ -596,6 +752,11 @@ pub mod memory {
             Ok(self.events.lock().unwrap().insert(event_id.to_owned()))
         }
 
+        async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+            self.events.lock().unwrap().remove(event_id);
+            Ok(())
+        }
+
         async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
             Ok(self
                 .rows
@@ -612,8 +773,264 @@ pub mod memory {
                 .collect())
         }
 
+        async fn confirmed_due_for_reversal_check(
+            &self,
+            confirmed_after: OffsetDateTime,
+            checked_before: OffsetDateTime,
+        ) -> Result<Vec<Correlation>, StoreError> {
+            let rows = self.rows.lock().unwrap();
+            let meta = self.meta.lock().unwrap();
+            let mut due: Vec<(Option<OffsetDateTime>, OffsetDateTime, Correlation)> = rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.state == CorrelationState::Confirmed && row.session_id.is_some()
+                })
+                .filter_map(|(key, row)| {
+                    let meta = meta.get(key).copied().unwrap_or_default();
+                    let confirmed_at = meta.confirmed_at?;
+                    let checked_ok = meta
+                        .reversal_checked_at
+                        .is_none_or(|checked| checked <= checked_before);
+                    (confirmed_at >= confirmed_after && checked_ok)
+                        .then(|| (meta.reversal_checked_at, confirmed_at, row.clone()))
+                })
+                .collect();
+            due.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            Ok(due.into_iter().map(|(_, _, row)| row).take(200).collect())
+        }
+
+        async fn mark_reversal_checked(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            checked_at: OffsetDateTime,
+        ) -> Result<(), StoreError> {
+            let key = (creator.to_owned(), bundle_id.to_owned());
+            let confirmed = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|row| row.state == CorrelationState::Confirmed);
+            if confirmed {
+                self.meta
+                    .lock()
+                    .unwrap()
+                    .entry(key)
+                    .or_default()
+                    .reversal_checked_at = Some(checked_at);
+            }
+            Ok(())
+        }
+
         async fn healthy(&self) -> bool {
             true
         }
+    }
+}
+
+/// The Postgres store against a real database. Runs when
+/// `FIAT_TEST_DATABASE_URL` is set (CI provides a Postgres service); rows
+/// use a per-run creator so runs never interfere.
+#[cfg(test)]
+mod postgres_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Concurrent `CREATE ... IF NOT EXISTS` on a fresh database can race in
+    /// Postgres, so the tests bootstrap the schema one at a time.
+    static BOOTSTRAP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn store() -> Option<PostgresStore> {
+        let Ok(url) = std::env::var("FIAT_TEST_DATABASE_URL") else {
+            eprintln!("FIAT_TEST_DATABASE_URL unset: skipping the Postgres store test");
+            return None;
+        };
+        let _bootstrap = BOOTSTRAP.lock().await;
+        // Connecting twice proves the schema bootstrap is idempotent.
+        PostgresStore::connect(&url).await.expect("first connect");
+        Some(PostgresStore::connect(&url).await.expect("second connect"))
+    }
+
+    fn new_row(creator: &str, bundle_id: &str) -> NewCorrelation {
+        NewCorrelation {
+            creator: creator.to_owned(),
+            bundle_id: bundle_id.to_owned(),
+            lock_resource: format!("{creator}/pub/locks.app/usd.json"),
+            reader: "pubkyreader".to_owned(),
+            asset: "USD".to_owned(),
+            amount_minor: 1999,
+        }
+    }
+
+    async fn paid_row(store: &PostgresStore, creator: &str, bundle_id: &str, at: OffsetDateTime) {
+        assert_eq!(
+            store.insert_new(new_row(creator, bundle_id)).await.unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert!(store
+            .set_session(
+                creator,
+                bundle_id,
+                "stripe",
+                "cs_1",
+                "https://x",
+                0,
+                1,
+                None
+            )
+            .await
+            .unwrap());
+        store
+            .mark_paid(
+                creator,
+                bundle_id,
+                true,
+                Some(&format!("pi_{creator}_{bundle_id}")),
+                at,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reversal_columns_and_queries_round_trip() {
+        let Some(store) = store().await else {
+            return;
+        };
+        // Postgres keeps microseconds; truncate so round-trips compare equal.
+        let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+            .unwrap();
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let mine = |rows: Vec<Correlation>| -> Vec<String> {
+            rows.into_iter()
+                .filter(|row| row.creator == creator)
+                .map(|row| row.bundle_id)
+                .collect()
+        };
+        let hour = Duration::from_secs(3600);
+        let day = Duration::from_secs(86_400);
+
+        // Reversed before confirmation.
+        paid_row(&store, &creator, "EARLY", now).await;
+        assert_eq!(
+            store.mark_reversed(&creator, "EARLY", now).await.unwrap(),
+            ReversalOutcome::Reversed
+        );
+        assert_eq!(
+            store.mark_reversed(&creator, "EARLY", now).await.unwrap(),
+            ReversalOutcome::Unchanged
+        );
+
+        // Confirmed: the confirmation counts as the first check.
+        paid_row(&store, &creator, "LATE", now).await;
+        store.mark_confirmed(&creator, "LATE", now).await.unwrap();
+        assert!(mine(
+            store
+                .confirmed_due_for_reversal_check(now - day, now - Duration::from_secs(1))
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        assert!(mine(
+            store
+                .confirmed_due_for_reversal_check(now - day, now - hour)
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        let later = now + hour;
+        assert_eq!(
+            mine(
+                store
+                    .confirmed_due_for_reversal_check(later - day, later - hour)
+                    .await
+                    .unwrap()
+            ),
+            vec!["LATE".to_owned()]
+        );
+        // Outside the watch window it is no longer listed.
+        assert!(mine(
+            store
+                .confirmed_due_for_reversal_check(now + Duration::from_secs(1), later - hour)
+                .await
+                .unwrap()
+        )
+        .is_empty());
+
+        store
+            .mark_reversal_checked(&creator, "LATE", later)
+            .await
+            .unwrap();
+        assert!(mine(
+            store
+                .confirmed_due_for_reversal_check(later - day, later - Duration::from_secs(1))
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        assert_eq!(
+            mine(
+                store
+                    .confirmed_due_for_reversal_check(later - day, later + hour)
+                    .await
+                    .unwrap()
+            ),
+            vec!["LATE".to_owned()]
+        );
+
+        // Reversed after confirmation, recorded as such, and off the watch.
+        assert_eq!(
+            store.mark_reversed(&creator, "LATE", later).await.unwrap(),
+            ReversalOutcome::ReversedAfterConfirm
+        );
+        assert_eq!(
+            store.get(&creator, "LATE").await.unwrap().unwrap().state,
+            CorrelationState::Reversed
+        );
+        assert!(mine(
+            store
+                .confirmed_due_for_reversal_check(later - day, later + day)
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        assert_eq!(
+            store
+                .find_by_payment_intent(&format!("pi_{creator}_LATE"))
+                .await
+                .unwrap()
+                .unwrap()
+                .bundle_id,
+            "LATE"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgotten_webhook_events_are_processed_again() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let event_id = format!(
+            "evt_test_{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        assert!(store
+            .record_webhook_event(&event_id, "charge.refunded")
+            .await
+            .unwrap());
+        assert!(!store
+            .record_webhook_event(&event_id, "charge.refunded")
+            .await
+            .unwrap());
+        store.forget_webhook_event(&event_id).await.unwrap();
+        assert!(store
+            .record_webhook_event(&event_id, "charge.refunded")
+            .await
+            .unwrap());
     }
 }

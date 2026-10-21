@@ -36,7 +36,8 @@ use crate::store::{
 };
 use crate::stripe::{client_reference, idempotency_key, StripeProcessor};
 use crate::verification::{
-    bound_processor, promote_if_still_paid, pull_and_apply, ProcessorKind, Processors,
+    apply_reversal, bound_processor, promote_if_still_paid, pull_and_apply, ProcessorKind,
+    Processors, PullOutcome,
 };
 use crate::wire::{
     parse_lock_resource, validate_id, CheckoutSessionRequest, CheckoutSessionResponse,
@@ -543,22 +544,52 @@ async fn transaction_status(
             correlation
         };
 
-    let status = match report(
-        &correlation,
-        now,
-        state.settlement_delay,
-        state.synthesized_confirmations,
-    ) {
-        Report::Immediate(status) => status,
-        Report::PromotionDue { fallback } => {
-            if promote_if_still_paid(&state.store, &state.processors, &correlation, now).await {
+    let confirmed = crate::wire::TransactionStatus {
+        status: crate::wire::StatusKind::Confirmed,
+        confirmations: state.synthesized_confirmations,
+        amount_matched: true,
+    };
+    let undetected = crate::wire::TransactionStatus {
+        status: crate::wire::StatusKind::Undetected,
+        confirmations: 0,
+        amount_matched: false,
+    };
+    let status = if correlation.state == CorrelationState::Confirmed {
+        // `confirmed` is what releases the good, so it is only ever served
+        // on a fresh pull that still shows the payment unrefunded and
+        // undisputed. An unreadable processor holds at `detected`.
+        match pull_and_apply(&state.store, &state.processors, &correlation, now).await {
+            PullOutcome::Paid {
+                amount_matched: true,
+            } => confirmed,
+            PullOutcome::Reversed => undetected,
+            PullOutcome::Paid { .. } | PullOutcome::Unpaid | PullOutcome::Unavailable => {
                 crate::wire::TransactionStatus {
-                    status: crate::wire::StatusKind::Confirmed,
-                    confirmations: state.synthesized_confirmations,
-                    amount_matched: true,
+                    status: crate::wire::StatusKind::Detected,
+                    confirmations: 0,
+                    amount_matched: correlation.amount_matched,
                 }
-            } else {
-                fallback
+            }
+        }
+    } else {
+        match report(
+            &correlation,
+            now,
+            state.settlement_delay,
+            state.synthesized_confirmations,
+        ) {
+            Report::Immediate(status) => status,
+            Report::PromotionDue { fallback } => {
+                if promote_if_still_paid(&state.store, &state.processors, &correlation, now).await {
+                    confirmed
+                } else {
+                    match state.store.get(&request.creator, &request.bundle_id).await {
+                        Ok(Some(refreshed)) if refreshed.state == CorrelationState::Reversed => {
+                            undetected
+                        }
+                        _ => fallback,
+                    }
+                }
             }
         }
     };
@@ -736,64 +767,115 @@ async fn stripe_webhook(
         .unwrap_or(Value::Null);
     tracing::info!(event_id, event_type, "stripe webhook accepted (hint only)");
 
+    match handle_stripe_event(&state, stripe, event_id, event_type, &object).await {
+        Ok(()) => Json(json!({"received": true})).into_response(),
+        Err(Transient) => release_webhook_event(&state, event_id).await,
+    }
+}
+
+/// A webhook whose processing failed for a reason a redelivery can fix
+/// (processor or store unavailable).
+struct Transient;
+
+/// Forgets the event id and answers 503, so the processor's retry is
+/// processed rather than deduplicated. The reversal watch in the poll
+/// worker covers the case where the processor stops retrying.
+async fn release_webhook_event(state: &Arc<AppState>, event_id: &str) -> Response {
+    if let Err(error) = state.store.forget_webhook_event(event_id).await {
+        tracing::error!(%error, event_id, "failed to release webhook event for redelivery");
+    }
+    ApiError::Unavailable.into_response()
+}
+
+async fn handle_stripe_event(
+    state: &Arc<AppState>,
+    stripe: &Arc<StripeProcessor>,
+    event_id: &str,
+    event_type: &str,
+    object: &Value,
+) -> Result<(), Transient> {
     let now = OffsetDateTime::now_utc();
     match event_type {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             let Some(reference) = object.get("client_reference_id").and_then(Value::as_str) else {
                 tracing::warn!(event_id, "completed session carries no client_reference_id");
-                return Json(json!({"received": true})).into_response();
+                return Ok(());
             };
             let Some((creator, bundle_id)) = reference.split_once('_') else {
                 tracing::warn!(event_id, reference, "unparseable client_reference_id");
-                return Json(json!({"received": true})).into_response();
+                return Ok(());
             };
             match state.store.get(creator, bundle_id).await {
                 Ok(Some(correlation)) => {
                     // The webhook body is a hint. The pull is the fact.
-                    pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+                    let outcome =
+                        pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+                    if outcome == PullOutcome::Unavailable {
+                        return Err(Transient);
+                    }
                 }
                 Ok(None) => {
                     tracing::warn!(event_id, reference, "webhook for unknown correlation");
                 }
-                Err(error) => tracing::error!(%error, "correlation lookup failed"),
+                Err(error) => {
+                    tracing::error!(%error, "correlation lookup failed");
+                    return Err(Transient);
+                }
             }
         }
         "charge.refunded" | "charge.dispute.created" => {
-            if let Some(charge_id) = object.get("id").and_then(Value::as_str) {
-                // Verify the reversal by pulling the charge before acting.
-                match stripe.retrieve_charge(charge_id).await {
-                    Ok(charge) if charge.refunded || charge.disputed => {
-                        if let Some(payment_intent) = charge.payment_intent.as_deref() {
-                            match state.store.find_by_payment_intent(payment_intent).await {
-                                Ok(Some(correlation)) => {
-                                    if let Err(error) = state
-                                        .store
-                                        .mark_reversed(&correlation.creator, &correlation.bundle_id)
-                                        .await
-                                    {
-                                        tracing::error!(%error, "failed to persist reversal");
-                                    } else {
-                                        tracing::warn!(
-                                            creator = %correlation.creator,
-                                            bundle_id = %correlation.bundle_id,
-                                            charge_id,
-                                            "verified reversal recorded; promotion suppressed"
-                                        );
-                                    }
-                                }
-                                Ok(None) => tracing::warn!(
-                                    charge_id,
-                                    "reversal for a charge with no open correlation"
-                                ),
-                                Err(error) => tracing::error!(%error, "lookup failed"),
-                            }
-                        }
+            // A refund event's object is the charge; a dispute event's object
+            // is the dispute, which names its charge.
+            let charge_id = if event_type == "charge.refunded" {
+                object.get("id")
+            } else {
+                object.get("charge")
+            };
+            let Some(charge_id) = charge_id.and_then(Value::as_str) else {
+                tracing::warn!(event_id, event_type, "reversal event names no charge");
+                return Ok(());
+            };
+            // Verify the reversal by pulling the charge before acting.
+            let charge = match stripe.retrieve_charge(charge_id).await {
+                Ok(charge) => charge,
+                Err(error) => {
+                    tracing::error!(%error, charge_id, "charge pull failed");
+                    return Err(Transient);
+                }
+            };
+            if !charge.is_reversed() {
+                tracing::warn!(
+                    charge_id,
+                    "reversal webhook not corroborated by charge pull; ignored"
+                );
+                return Ok(());
+            }
+            let Some(payment_intent) = charge.payment_intent.as_deref() else {
+                tracing::warn!(charge_id, "reversed charge carries no payment intent");
+                return Ok(());
+            };
+            match state.store.find_by_payment_intent(payment_intent).await {
+                Ok(Some(correlation)) => {
+                    if let Err(error) = apply_reversal(
+                        &state.store,
+                        &correlation.creator,
+                        &correlation.bundle_id,
+                        ProcessorKind::Stripe.as_str(),
+                        Some(payment_intent),
+                        now,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "failed to persist reversal");
+                        return Err(Transient);
                     }
-                    Ok(_) => tracing::warn!(
-                        charge_id,
-                        "reversal webhook not corroborated by charge pull; ignored"
-                    ),
-                    Err(error) => tracing::error!(%error, charge_id, "charge pull failed"),
+                }
+                Ok(None) => {
+                    tracing::warn!(charge_id, "reversal for a charge with no known correlation")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "lookup failed");
+                    return Err(Transient);
                 }
             }
         }
@@ -801,15 +883,14 @@ async fn stripe_webhook(
             tracing::debug!(event_type = other, "ignoring unhandled webhook event type");
         }
     }
-    Json(json!({"received": true})).into_response()
+    Ok(())
 }
 
-/// Capture statuses that corroborate a reversal webhook.
+/// Capture statuses that corroborate a reversal webhook: money returned to
+/// the buyer, or a capture that never completed.
 fn is_reversal_capture_status(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("REFUNDED" | "PARTIALLY_REFUNDED" | "REVERSED" | "DECLINED" | "FAILED")
-    )
+    crate::paypal::is_reversed_capture_status(status)
+        || matches!(status, Some("DECLINED" | "FAILED"))
 }
 
 /// Extracts the capture id a reversal event refers to: the `up` link when
@@ -841,45 +922,45 @@ async fn mark_paypal_capture_reversed(
     state: &Arc<AppState>,
     capture_id: &str,
     custom_id: Option<&str>,
-) {
+) -> Result<(), Transient> {
     let correlation: Option<Correlation> = match custom_id.and_then(|id| id.split_once('_')) {
         Some((creator, bundle_id)) => match state.store.get(creator, bundle_id).await {
             Ok(correlation) => correlation,
             Err(error) => {
                 tracing::error!(%error, "lookup failed");
-                return;
+                return Err(Transient);
             }
         },
         None => match state.store.find_by_payment_intent(capture_id).await {
             Ok(correlation) => correlation,
             Err(error) => {
                 tracing::error!(%error, "lookup failed");
-                return;
+                return Err(Transient);
             }
         },
     };
     match correlation {
         Some(correlation) => {
-            if let Err(error) = state
-                .store
-                .mark_reversed(&correlation.creator, &correlation.bundle_id)
-                .await
+            if let Err(error) = apply_reversal(
+                &state.store,
+                &correlation.creator,
+                &correlation.bundle_id,
+                ProcessorKind::Paypal.as_str(),
+                Some(capture_id),
+                OffsetDateTime::now_utc(),
+            )
+            .await
             {
                 tracing::error!(%error, "failed to persist reversal");
-            } else {
-                tracing::warn!(
-                    creator = %correlation.creator,
-                    bundle_id = %correlation.bundle_id,
-                    capture_id,
-                    "verified paypal reversal recorded; promotion suppressed"
-                );
+                return Err(Transient);
             }
         }
         None => tracing::warn!(
             capture_id,
-            "reversal for a capture with no open correlation"
+            "reversal for a capture with no known correlation"
         ),
     }
+    Ok(())
 }
 
 async fn paypal_webhook(
@@ -958,6 +1039,19 @@ async fn paypal_webhook(
     let resource = event.get("resource").cloned().unwrap_or(Value::Null);
     tracing::info!(event_id, event_type, "paypal webhook accepted (hint only)");
 
+    match handle_paypal_event(&state, paypal, event_id, event_type, &resource).await {
+        Ok(()) => Json(json!({"received": true})).into_response(),
+        Err(Transient) => release_webhook_event(&state, event_id).await,
+    }
+}
+
+async fn handle_paypal_event(
+    state: &Arc<AppState>,
+    paypal: &Arc<crate::paypal::PaypalProcessor>,
+    event_id: &str,
+    event_type: &str,
+    resource: &Value,
+) -> Result<(), Transient> {
     let now = OffsetDateTime::now_utc();
     match event_type {
         "CHECKOUT.ORDER.APPROVED"
@@ -977,53 +1071,66 @@ async fn paypal_webhook(
             let Some((creator, bundle_id)) = reference.and_then(|value| value.split_once('_'))
             else {
                 tracing::warn!(event_id, "paypal event carries no parseable custom_id");
-                return Json(json!({"received": true})).into_response();
+                return Ok(());
             };
             match state.store.get(creator, bundle_id).await {
                 Ok(Some(correlation)) => {
                     // The webhook body is a hint. The pull is the fact.
-                    pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+                    let outcome =
+                        pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+                    if outcome == PullOutcome::Unavailable {
+                        return Err(Transient);
+                    }
                 }
                 Ok(None) => {
                     tracing::warn!(event_id, "paypal webhook for unknown correlation");
                 }
-                Err(error) => tracing::error!(%error, "correlation lookup failed"),
+                Err(error) => {
+                    tracing::error!(%error, "correlation lookup failed");
+                    return Err(Transient);
+                }
             }
         }
         "PAYMENT.CAPTURE.REFUNDED" | "PAYMENT.CAPTURE.REVERSED" | "PAYMENT.CAPTURE.DENIED" => {
-            if let Some(capture_id) = reversal_capture_id(&resource) {
-                // Verify the reversal by pulling the capture before acting.
-                match paypal.retrieve_capture(&capture_id).await {
-                    Ok(capture) if is_reversal_capture_status(capture.status.as_deref()) => {
-                        mark_paypal_capture_reversed(
-                            &state,
-                            &capture.id,
-                            capture.custom_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    Ok(_) => tracing::warn!(
-                        capture_id,
-                        "reversal webhook not corroborated by capture pull; ignored"
-                    ),
-                    Err(error) => tracing::error!(%error, capture_id, "capture pull failed"),
+            let Some(capture_id) = reversal_capture_id(resource) else {
+                tracing::warn!(event_id, event_type, "reversal event names no capture");
+                return Ok(());
+            };
+            // Verify the reversal by pulling the capture before acting.
+            match paypal.retrieve_capture(&capture_id).await {
+                Ok(capture) if is_reversal_capture_status(capture.status.as_deref()) => {
+                    mark_paypal_capture_reversed(state, &capture.id, capture.custom_id.as_deref())
+                        .await?;
+                }
+                Ok(_) => tracing::warn!(
+                    capture_id,
+                    "reversal webhook not corroborated by capture pull; ignored"
+                ),
+                Err(error) => {
+                    tracing::error!(%error, capture_id, "capture pull failed");
+                    return Err(Transient);
                 }
             }
         }
         "CUSTOMER.DISPUTE.CREATED" => {
-            if let Some(dispute_id) = resource.get("dispute_id").and_then(Value::as_str) {
-                // Verify by pulling the dispute; its transactions map to
-                // captures, which map to correlations via the persisted
-                // payment reference.
-                match paypal.retrieve_dispute(dispute_id).await {
-                    Ok(dispute) => {
-                        for transaction in &dispute.disputed_transactions {
-                            if let Some(capture_id) = transaction.seller_transaction_id.as_deref() {
-                                mark_paypal_capture_reversed(&state, capture_id, None).await;
-                            }
+            let Some(dispute_id) = resource.get("dispute_id").and_then(Value::as_str) else {
+                tracing::warn!(event_id, "dispute event names no dispute");
+                return Ok(());
+            };
+            // Verify by pulling the dispute; its transactions map to
+            // captures, which map to correlations via the persisted
+            // payment reference.
+            match paypal.retrieve_dispute(dispute_id).await {
+                Ok(dispute) => {
+                    for transaction in &dispute.disputed_transactions {
+                        if let Some(capture_id) = transaction.seller_transaction_id.as_deref() {
+                            mark_paypal_capture_reversed(state, capture_id, None).await?;
                         }
                     }
-                    Err(error) => tracing::error!(%error, dispute_id, "dispute pull failed"),
+                }
+                Err(error) => {
+                    tracing::error!(%error, dispute_id, "dispute pull failed");
+                    return Err(Transient);
                 }
             }
         }
@@ -1031,7 +1138,7 @@ async fn paypal_webhook(
             tracing::debug!(event_type = other, "ignoring unhandled webhook event type");
         }
     }
-    Json(json!({"received": true})).into_response()
+    Ok(())
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {

@@ -72,6 +72,12 @@ pub struct Config {
     pub synthesized_confirmations: u32,
     /// Slow-poll interval for open fiat correlations (lost-webhook recovery).
     pub poll_interval: Duration,
+    /// How long after confirmation the poll worker keeps re-checking for a
+    /// refund or dispute. Defaults to 180 days, PayPal's dispute window
+    /// (Stripe's card dispute window is up to 120 days).
+    pub reversal_watch_window: Duration,
+    /// Minimum time between two reversal checks of one confirmed payment.
+    pub reversal_recheck_interval: Duration,
     /// Criterion assets accepted on the fiat path (uppercase ISO 4217).
     pub allowed_assets: Vec<String>,
     /// Legacy single-shop redirect targets, used for checkout requests that
@@ -206,6 +212,20 @@ impl Config {
                 ConfigError::Invalid("FIAT_SYNTHESIZED_CONFIRMATIONS", "too large".into())
             })?;
         let poll_interval = Duration::from_secs(parse_u64("FIAT_POLL_INTERVAL_SECONDS", 60)?);
+        let reversal_watch_days = parse_u64("FIAT_REVERSAL_WATCH_DAYS", 180)?;
+        if reversal_watch_days == 0 || reversal_watch_days > 3650 {
+            return Err(ConfigError::Invalid(
+                "FIAT_REVERSAL_WATCH_DAYS",
+                "must be between 1 and 3650".to_owned(),
+            ));
+        }
+        let reversal_recheck_seconds = parse_u64("FIAT_REVERSAL_RECHECK_SECONDS", 3600)?;
+        if reversal_recheck_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "FIAT_REVERSAL_RECHECK_SECONDS",
+                "must be positive".to_owned(),
+            ));
+        }
 
         let allowed_assets = std::env::var("FIAT_ALLOWED_ASSETS")
             .unwrap_or_else(|_| "USD".to_owned())
@@ -241,6 +261,8 @@ impl Config {
             settlement_delay,
             synthesized_confirmations,
             poll_interval,
+            reversal_watch_window: Duration::from_secs(reversal_watch_days * 86_400),
+            reversal_recheck_interval: Duration::from_secs(reversal_recheck_seconds),
             allowed_assets,
             checkout_success_url,
             checkout_cancel_url,

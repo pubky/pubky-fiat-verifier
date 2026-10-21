@@ -106,9 +106,38 @@ impl Order {
             .flat_map(|payments| payments.captures.iter())
             .find(|capture| capture.status.as_deref() == Some("COMPLETED"))
     }
+
+    /// The first capture PayPal reports as refunded (fully or partially) or
+    /// reversed. A refund moves the capture out of `COMPLETED`, so without
+    /// this check a refunded order would simply read as "not paid".
+    pub fn reversed_capture(&self) -> Option<&Capture> {
+        self.purchase_units
+            .iter()
+            .filter_map(|unit| unit.payments.as_ref())
+            .flat_map(|payments| payments.captures.iter())
+            .find(|capture| is_reversed_capture_status(capture.status.as_deref()))
+    }
 }
 
-/// `GET /v1/customer-disputes/:id` — only the transaction linkage is needed.
+/// Capture statuses that mean the money went back to the buyer.
+pub fn is_reversed_capture_status(status: Option<&str>) -> bool {
+    matches!(status, Some("REFUNDED" | "PARTIALLY_REFUNDED" | "REVERSED"))
+}
+
+/// `GET /v1/customer/disputes?disputed_transaction_id=...` — summary items;
+/// only their existence matters.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DisputeList {
+    #[serde(default)]
+    pub items: Vec<DisputeSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DisputeSummary {
+    pub dispute_id: String,
+}
+
+/// `GET /v1/customer/disputes/:id` — only the transaction linkage is needed.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Dispute {
     #[serde(default)]
@@ -302,7 +331,20 @@ impl PaypalProcessor {
         let token = self.access_token().await?;
         let response = self
             .http
-            .get(self.endpoint(&format!("/v1/customer-disputes/{dispute_id}")))
+            .get(self.endpoint(&format!("/v1/customer/disputes/{dispute_id}")))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        Self::parse(response).await
+    }
+
+    /// Disputes PayPal holds against one capture, in any state.
+    pub async fn disputes_for_capture(&self, capture_id: &str) -> Result<DisputeList, PaypalError> {
+        let token = self.access_token().await?;
+        let response = self
+            .http
+            .get(self.endpoint("/v1/customer/disputes"))
+            .query(&[("disputed_transaction_id", capture_id)])
             .bearer_auth(token)
             .send()
             .await?;
@@ -481,5 +523,32 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(order.completed_capture().unwrap().id, "CAP2");
+    }
+
+    #[test]
+    fn refunded_capture_is_a_reversal_not_a_payment() {
+        for status in ["REFUNDED", "PARTIALLY_REFUNDED", "REVERSED"] {
+            let order: Order = serde_json::from_value(serde_json::json!({
+                "id": "ORD1",
+                "status": "COMPLETED",
+                "purchase_units": [{
+                    "payments": {"captures": [
+                        {"id": "CAP1", "status": status,
+                         "amount": {"currency_code": "USD", "value": "19.99"}}
+                    ]}
+                }]
+            }))
+            .unwrap();
+            assert!(order.completed_capture().is_none(), "{status}");
+            assert_eq!(order.reversed_capture().unwrap().id, "CAP1", "{status}");
+        }
+    }
+
+    #[test]
+    fn pending_or_completed_capture_is_not_a_reversal() {
+        for status in ["COMPLETED", "PENDING", "DECLINED", "FAILED"] {
+            assert!(!is_reversed_capture_status(Some(status)), "{status}");
+        }
+        assert!(!is_reversed_capture_status(None));
     }
 }
