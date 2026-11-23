@@ -1,5 +1,5 @@
-//! Token bucket for the buyer-facing endpoint (same fractional-refill shape
-//! as paykit-server's signed-request limiter).
+//! Token buckets for request and outbound-pull budgets (same fractional-refill
+//! shape as paykit-server's signed-request limiter).
 
 use std::sync::Mutex;
 use std::time::Instant;

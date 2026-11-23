@@ -24,7 +24,7 @@ use sha2::Sha256;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
-use crate::http::{router, AppState};
+use crate::http::{router, AppState, StatusPullCache};
 use crate::lock_fetch::{CriterionSource, LockCriterion, LockFetchError};
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -91,6 +91,8 @@ struct MockStripe {
     /// One-shot gate: when armed, the next create call blocks until the
     /// test releases it (deterministic race windows, no sleeps).
     create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    /// Checkout Session retrieve calls received.
+    session_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockStripe {
@@ -209,6 +211,8 @@ async fn mock_get_session(
     State(mock): State<MockStripe>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
+    mock.session_reads
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     match mock.sessions.lock().unwrap().get(&id) {
         Some(session) => Json(session.clone()).into_response(),
         None => (
@@ -654,6 +658,11 @@ struct HarnessOptions {
     with_stripe: bool,
     with_paypal: bool,
     paypal_webhook_id: bool,
+    /// (rate per second, burst) of the checkout-session limiter.
+    checkout_bucket: (u64, u64),
+    status_pull_freshness: Duration,
+    /// (rate per second, burst) of the status processor-pull limiter.
+    status_pull_bucket: (u64, u64),
 }
 
 impl Default for HarnessOptions {
@@ -663,6 +672,9 @@ impl Default for HarnessOptions {
             with_stripe: true,
             with_paypal: false,
             paypal_webhook_id: true,
+            checkout_bucket: (100, 100),
+            status_pull_freshness: Duration::from_secs(15),
+            status_pull_bucket: (1000, 1000),
         }
     }
 }
@@ -791,7 +803,13 @@ async fn build_harness(options: HarnessOptions) -> Harness {
         checkout_success_url: "https://app.test/success".into(),
         checkout_cancel_url: "https://app.test/cancel".into(),
         buyer_return_origins: vec![ORIGIN_A.into(), ORIGIN_B.into()],
-        checkout_limiter: TokenBucket::new(100, 100),
+        checkout_limiter: TokenBucket::new(options.checkout_bucket.0, options.checkout_bucket.1),
+        status_pull_cache: StatusPullCache::default(),
+        status_pull_freshness: options.status_pull_freshness,
+        status_pull_limiter: TokenBucket::new(
+            options.status_pull_bucket.0,
+            options.status_pull_bucket.1,
+        ),
     });
     let base = spawn(router(state)).await;
     Harness {
@@ -2375,7 +2393,11 @@ async fn dispute_before_detection_never_marks_paid() {
 
 #[tokio::test]
 async fn confirmed_status_is_rechecked_and_a_later_refund_withdraws_it() {
-    let harness = harness().await;
+    let harness = build_harness(HarnessOptions {
+        status_pull_freshness: Duration::ZERO,
+        ..HarnessOptions::default()
+    })
+    .await;
     confirm_stripe_purchase(&harness).await;
     assert_eq!(
         harness.status(BUNDLE).await,
@@ -2586,4 +2608,231 @@ async fn paypal_dispute_lookup_outage_holds_confirmation() {
     *harness.paypal_mock.disputes_unavailable.lock().unwrap() = false;
     harness.tick(paid_at + harness.settlement_delay).await;
     assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+}
+
+// -- checkout budget, processor binding and status pull sharing --------------------
+
+#[tokio::test]
+async fn malformed_checkout_bodies_do_not_spend_the_checkout_budget() {
+    let harness = build_harness(HarnessOptions {
+        checkout_bucket: (0, 3),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    for _ in 0..3 {
+        let junk = harness
+            .http
+            .post(format!("{}/checkout-sessions", harness.base))
+            .header("content-type", "application/json")
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(junk.status().as_u16(), 400);
+    }
+
+    let buyer = harness.checkout(BUNDLE, None).await;
+    assert_eq!(
+        buyer.status().as_u16(),
+        200,
+        "a live session must be served after malformed requests"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_checkouts_on_different_processors_bind_one_processor() {
+    let harness = harness_dual(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let stripe_url = format!("{}/checkout-sessions", harness.base);
+    let stripe_buyer = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(stripe_url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": "stripe"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 1).await;
+
+    let paypal = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(paypal.status().as_u16(), 200);
+    let paypal: Value = paypal.json().await.unwrap();
+    assert_eq!(paypal["processor"], "paypal");
+
+    release.send(()).unwrap();
+    let stripe = stripe_buyer.await.unwrap();
+    let stripe_status = stripe.status().as_u16();
+    let stripe_body: Value = stripe.json().await.unwrap_or(Value::Null);
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(
+        row.processor.as_deref(),
+        Some("paypal"),
+        "the first persisted binding must not be overwritten"
+    );
+    assert!(
+        stripe_status == 409 || stripe_body["processor"] == "paypal",
+        "the losing buyer gets a conflict or the bound session, got {stripe_status} {stripe_body}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_status_polls_of_a_confirmed_purchase_share_one_processor_pull() {
+    let harness = harness().await;
+    confirm_stripe_purchase(&harness).await;
+
+    let before = harness
+        .stripe_mock
+        .session_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..5 {
+        harness.status(BUNDLE).await;
+    }
+    let reads = harness
+        .stripe_mock
+        .session_reads
+        .load(std::sync::atomic::Ordering::SeqCst)
+        - before;
+    assert!(
+        reads <= 1,
+        "five status polls inside one cache window made {reads} Checkout Session reads"
+    );
+}
+
+#[tokio::test]
+async fn reused_live_sessions_do_not_spend_the_checkout_budget() {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_bucket: (0, 1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let first = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(first.status().as_u16(), 200);
+    let first: Value = first.json().await.unwrap();
+    for _ in 0..3 {
+        let reused = harness.checkout(BUNDLE, Some("stripe")).await;
+        assert_eq!(reused.status().as_u16(), 200);
+        let reused: Value = reused.json().await.unwrap();
+        assert_eq!(reused["checkout_url"], first["checkout_url"]);
+    }
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_mint_over_the_checkout_budget_is_rate_limited() {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_bucket: (0, 1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    assert_eq!(
+        harness
+            .invoice("usd", "OTHERBUNDLE1")
+            .await
+            .status()
+            .as_u16(),
+        204
+    );
+
+    assert_eq!(
+        harness
+            .checkout(BUNDLE, Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        harness
+            .checkout("OTHERBUNDLE1", Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        429
+    );
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn status_poll_with_an_empty_pull_budget_holds_a_confirmed_purchase_at_detected() {
+    let harness = build_harness(HarnessOptions {
+        status_pull_freshness: Duration::ZERO,
+        status_pull_bucket: (0, 1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    confirm_stripe_purchase(&harness).await;
+    assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
+
+    let before = harness
+        .stripe_mock
+        .session_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "detected", "confirmations": 0, "amount_matched": true})
+    );
+    assert_eq!(
+        harness
+            .stripe_mock
+            .session_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+}
+
+#[tokio::test]
+async fn status_poll_with_an_empty_pull_budget_does_not_advance_a_created_purchase() {
+    let harness = build_harness(HarnessOptions {
+        status_pull_bucket: (0, 0),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+
+    let before = harness
+        .stripe_mock
+        .session_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "undetected", "confirmations": 0, "amount_matched": false})
+    );
+    assert_eq!(
+        harness
+            .stripe_mock
+            .session_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Created);
+}
+
+#[tokio::test]
+async fn a_refund_seen_after_the_freshness_window_flips_the_status() {
+    let harness = build_harness(HarnessOptions {
+        status_pull_freshness: Duration::from_secs(1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    confirm_stripe_purchase(&harness).await;
+    assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
+
+    harness.stripe_mock.refund("cs_test_1", 1999);
+    assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
 }

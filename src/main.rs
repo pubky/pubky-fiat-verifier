@@ -18,7 +18,7 @@ mod worker;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::http::AppState;
+use crate::http::{AppState, StatusPullCache};
 use crate::lock_fetch::PubkyCriterionSource;
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -117,6 +117,12 @@ async fn main() {
         checkout_limiter: TokenBucket::new(
             config.checkout_rate_per_second,
             config.checkout_rate_burst,
+        ),
+        status_pull_cache: StatusPullCache::default(),
+        status_pull_freshness: config.status_pull_freshness,
+        status_pull_limiter: TokenBucket::new(
+            config.status_pull_rate_per_second,
+            config.status_pull_rate_burst,
         ),
     });
 

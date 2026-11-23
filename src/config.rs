@@ -92,9 +92,14 @@ pub struct Config {
     /// Max content-lock document size fetched from a homeserver.
     pub lock_resource_max_bytes: u64,
     pub lock_fetch_timeout: Duration,
-    /// Requests-per-second budget for the buyer-facing /checkout-sessions.
+    /// Session-mint budget for the buyer-facing /checkout-sessions.
     pub checkout_rate_per_second: u64,
     pub checkout_rate_burst: u64,
+    /// How long a status request may reuse a processor observation.
+    pub status_pull_freshness: Duration,
+    /// Outbound processor-pull budget shared by status requests.
+    pub status_pull_rate_per_second: u64,
+    pub status_pull_rate_burst: u64,
 }
 
 impl Config {
@@ -274,6 +279,12 @@ impl Config {
             )?),
             checkout_rate_per_second: parse_u64("FIAT_CHECKOUT_RATE_PER_SECOND", 5)?,
             checkout_rate_burst: parse_u64("FIAT_CHECKOUT_RATE_BURST", 20)?,
+            status_pull_freshness: Duration::from_secs(parse_u64(
+                "FIAT_STATUS_PULL_FRESHNESS_SECONDS",
+                15,
+            )?),
+            status_pull_rate_per_second: parse_u64("FIAT_STATUS_PULL_RATE_PER_SECOND", 10)?,
+            status_pull_rate_burst: parse_u64("FIAT_STATUS_PULL_RATE_BURST", 50)?,
         })
     }
 }

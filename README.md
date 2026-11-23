@@ -94,8 +94,8 @@ validity; the create response carries no expiry field).
 | created (no completed checkout) | `undetected, 0, false` |
 | paid (API pull verified), inside settlement delay | `detected, 0, amount_matched` |
 | paid, delay elapsed, fresh re-pull still paid and not refunded or disputed | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
-| confirmed, fresh re-pull on every status read still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
-| confirmed, processor unreadable on that read | `detected, 0, true` (held, never served blind) |
+| confirmed, pull within the freshness window still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| confirmed, processor unreadable or the status-pull budget is empty | `detected, 0, true` (held, never served blind) |
 | reversed — refunded (fully or partially) or disputed, pull-verified, before or after confirmation | `undetected, 0, false` |
 
 **What "paid" means.** A Stripe Checkout Session keeps `payment_status: paid` after a
@@ -172,7 +172,9 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_POLL_INTERVAL_SECONDS` | no | `60` | Slow-poll interval over open fiat correlations (lost-webhook recovery). |
 | `FIAT_REVERSAL_WATCH_DAYS` | no | `180` | How long after confirmation the poll worker keeps re-checking for a refund or dispute (1–3650). The default covers PayPal's 180-day dispute window; Stripe card disputes arrive within 120 days. |
 | `FIAT_REVERSAL_RECHECK_SECONDS` | no | `3600` | Minimum time between two reversal checks of one confirmed payment. Each Stripe check costs two API reads (session and PaymentIntent), each PayPal check two (order and disputes). |
-| `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket for `/checkout-sessions`. |
+| `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket charged only when `/checkout-sessions` mints a session; rejected bodies and live-session reuse spend nothing. |
+| `FIAT_STATUS_PULL_FRESHNESS_SECONDS` | no | `15` | How long status polls may reuse a paid or unpaid processor observation for the same session. `0` disables reuse. |
+| `FIAT_STATUS_PULL_RATE_PER_SECOND` / `FIAT_STATUS_PULL_RATE_BURST` | no | `10` / `50` | Outbound token bucket shared by real processor pulls from status requests. Cache hits, webhook corroboration pulls, and poll-worker pulls spend nothing. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
 
 ## Runbook

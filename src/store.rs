@@ -100,17 +100,14 @@ pub struct StoreError(pub String);
 pub trait CorrelationStore: Send + Sync {
     async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError>;
     async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError>;
-    /// Persists a freshly minted session. Conditional on the origin binding:
-    /// the update applies only while the stored `return_origin` is still
-    /// unbound (NULL — first binder wins) or already equals `return_origin`
-    /// (the origin the session's redirect URLs were derived from). A mint
-    /// against the static fallback URLs (`return_origin = None`) therefore
-    /// can never overwrite an origin-bound row, and vice versa — this is
-    /// what keeps "derived from the bound origin, never rebound" atomic
-    /// across concurrent checkouts and across processes. Returns `false`
-    /// when the guard rejected the write (a concurrent mint bound a
-    /// different origin first); the caller must then not serve the session
-    /// it just minted.
+    /// Persists a freshly minted session only while the row is `created` and
+    /// both bindings permit it. The stored `return_origin` must be unbound
+    /// (NULL) or equal `return_origin`. The processor must be wholly unbound
+    /// (NULL processor and session), or its effective value must equal the
+    /// minted processor; a legacy row with a session and NULL processor is
+    /// effectively Stripe. Thus the first persisted processor wins, while a
+    /// same-processor re-mint remains valid. Returns `false` when any guard
+    /// rejects the write; the caller must not serve the session it minted.
     #[allow(clippy::too_many_arguments)]
     async fn set_session(
         &self,
@@ -335,16 +332,16 @@ impl CorrelationStore for PostgresStore {
         session_attempt: i32,
         return_origin: Option<&str>,
     ) -> Result<bool, StoreError> {
-        // The origin guard: apply only while the row is unbound or bound to
-        // exactly the origin this session was minted for. With $8 NULL the
-        // second disjunct is never true, so a fallback-URL session can only
-        // persist onto a still-NULL row — never over an origin binding.
+        // One statement keeps the origin, processor, and state guards atomic.
+        // A legacy session with NULL processor is effectively Stripe.
         let updated = sqlx::query(
             "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
              checkout_expires_at = $6, session_attempt = $7, \
              return_origin = COALESCE($8, return_origin), updated_at = now() \
-             WHERE creator = $1 AND bundle_id = $2 \
-             AND (return_origin IS NULL OR return_origin = $8)",
+             WHERE creator = $1 AND bundle_id = $2 AND state = 'created' \
+             AND (return_origin IS NULL OR return_origin = $8) \
+             AND ((processor IS NULL AND session_id IS NULL) \
+                  OR COALESCE(processor, CASE WHEN session_id IS NOT NULL THEN 'stripe' END) = $3)",
         )
         .bind(creator)
         .bind(bundle_id)
@@ -644,10 +641,19 @@ pub mod memory {
             let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) else {
                 return Ok(false);
             };
+            if row.state != CorrelationState::Created {
+                return Ok(false);
+            }
             // Same origin guard as the SQL predicate: apply only while the
             // row is unbound or bound to exactly the minted origin. (When
             // `return_origin` is None this reduces to `is_none()`.)
             if row.return_origin.is_some() && row.return_origin.as_deref() != return_origin {
+                return Ok(false);
+            }
+            let wholly_unbound = row.processor.is_none() && row.session_id.is_none();
+            let effective_processor = crate::verification::bound_processor(row)
+                .map(crate::verification::ProcessorKind::as_str);
+            if !wholly_unbound && effective_processor != Some(processor) {
                 return Ok(false);
             }
             row.processor = Some(processor.to_owned());
@@ -795,7 +801,7 @@ pub mod memory {
                         .then(|| (meta.reversal_checked_at, confirmed_at, row.clone()))
                 })
                 .collect();
-            due.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            due.sort_by_key(|entry| (entry.0, entry.1));
             Ok(due.into_iter().map(|(_, _, row)| row).take(200).collect())
         }
 
@@ -825,6 +831,112 @@ pub mod memory {
 
         async fn healthy(&self) -> bool {
             true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const CREATOR: &str = "pubkycreator";
+
+        fn new_row(bundle_id: &str) -> NewCorrelation {
+            NewCorrelation {
+                creator: CREATOR.to_owned(),
+                bundle_id: bundle_id.to_owned(),
+                lock_resource: format!("{CREATOR}/pub/locks.app/usd.json"),
+                reader: "pubkyreader".to_owned(),
+                asset: "USD".to_owned(),
+                amount_minor: 1999,
+            }
+        }
+
+        async fn insert(store: &MemoryStore, bundle_id: &str) {
+            assert_eq!(
+                store.insert_new(new_row(bundle_id)).await.unwrap(),
+                InsertOutcome::Inserted
+            );
+        }
+
+        async fn mint(
+            store: &MemoryStore,
+            bundle_id: &str,
+            processor: &str,
+            session_id: &str,
+            attempt: i32,
+        ) -> bool {
+            store
+                .set_session(
+                    CREATOR,
+                    bundle_id,
+                    processor,
+                    session_id,
+                    "https://checkout.test/session",
+                    1000,
+                    attempt,
+                    None,
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn row(store: &MemoryStore, bundle_id: &str) -> Correlation {
+            store.get(CREATOR, bundle_id).await.unwrap().unwrap()
+        }
+
+        fn make_legacy(store: &MemoryStore, bundle_id: &str) {
+            store
+                .rows
+                .lock()
+                .unwrap()
+                .get_mut(&(CREATOR.to_owned(), bundle_id.to_owned()))
+                .unwrap()
+                .processor = None;
+        }
+
+        fn assert_unchanged(before: &Correlation, after: &Correlation) {
+            assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        }
+
+        #[tokio::test]
+        async fn set_session_guards_processor_binding_and_created_state() {
+            let store = MemoryStore::default();
+            for bundle in ["BOUND", "LEGACYPAYPAL", "PAID", "REMINT", "LEGACYSTRIPE"] {
+                insert(&store, bundle).await;
+            }
+
+            assert!(mint(&store, "BOUND", "stripe", "cs_1", 1).await);
+            let before = row(&store, "BOUND").await;
+            assert!(!mint(&store, "BOUND", "paypal", "pp_1", 2).await);
+            assert_unchanged(&before, &row(&store, "BOUND").await);
+
+            assert!(mint(&store, "LEGACYPAYPAL", "stripe", "cs_legacy", 1).await);
+            make_legacy(&store, "LEGACYPAYPAL");
+            let before = row(&store, "LEGACYPAYPAL").await;
+            assert!(!mint(&store, "LEGACYPAYPAL", "paypal", "pp_legacy", 2).await);
+            assert_unchanged(&before, &row(&store, "LEGACYPAYPAL").await);
+
+            assert!(mint(&store, "PAID", "stripe", "cs_paid", 1).await);
+            store
+                .mark_paid(CREATOR, "PAID", true, None, OffsetDateTime::now_utc())
+                .await
+                .unwrap();
+            let before = row(&store, "PAID").await;
+            assert!(!mint(&store, "PAID", "stripe", "cs_replacement", 2).await);
+            assert_unchanged(&before, &row(&store, "PAID").await);
+
+            assert!(mint(&store, "REMINT", "stripe", "cs_old", 1).await);
+            assert!(mint(&store, "REMINT", "stripe", "cs_new", 2).await);
+            let reminted = row(&store, "REMINT").await;
+            assert_eq!(reminted.processor.as_deref(), Some("stripe"));
+            assert_eq!(reminted.session_id.as_deref(), Some("cs_new"));
+
+            assert!(mint(&store, "LEGACYSTRIPE", "stripe", "cs_legacy", 1).await);
+            make_legacy(&store, "LEGACYSTRIPE");
+            assert!(mint(&store, "LEGACYSTRIPE", "stripe", "cs_new", 2).await);
+            let rebound = row(&store, "LEGACYSTRIPE").await;
+            assert_eq!(rebound.processor.as_deref(), Some("stripe"));
+            assert_eq!(rebound.session_id.as_deref(), Some("cs_new"));
         }
     }
 }
@@ -892,6 +1004,44 @@ mod postgres_tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn mint(
+        store: &PostgresStore,
+        creator: &str,
+        bundle_id: &str,
+        processor: &str,
+        session_id: &str,
+        attempt: i32,
+    ) -> bool {
+        store
+            .set_session(
+                creator,
+                bundle_id,
+                processor,
+                session_id,
+                "https://checkout.test/session",
+                1000,
+                attempt,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn make_legacy(store: &PostgresStore, creator: &str, bundle_id: &str) {
+        sqlx::query(
+            "UPDATE correlations SET processor = NULL WHERE creator = $1 AND bundle_id = $2",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    fn assert_unchanged(before: &Correlation, after: &Correlation) {
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
     }
 
     #[tokio::test]
@@ -1008,6 +1158,61 @@ mod postgres_tests {
                 .bundle_id,
             "LATE"
         );
+    }
+
+    #[tokio::test]
+    async fn set_session_guards_processor_binding_and_created_state() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        for bundle in ["BOUND", "LEGACYPAYPAL", "PAID", "REMINT", "LEGACYSTRIPE"] {
+            assert_eq!(
+                store.insert_new(new_row(&creator, bundle)).await.unwrap(),
+                InsertOutcome::Inserted
+            );
+        }
+        let row = |bundle| {
+            let store = &store;
+            let creator = &creator;
+            async move { store.get(creator, bundle).await.unwrap().unwrap() }
+        };
+
+        assert!(mint(&store, &creator, "BOUND", "stripe", "cs_1", 1).await);
+        let before = row("BOUND").await;
+        assert!(!mint(&store, &creator, "BOUND", "paypal", "pp_1", 2).await);
+        assert_unchanged(&before, &row("BOUND").await);
+
+        assert!(mint(&store, &creator, "LEGACYPAYPAL", "stripe", "cs_legacy", 1).await);
+        make_legacy(&store, &creator, "LEGACYPAYPAL").await;
+        let before = row("LEGACYPAYPAL").await;
+        assert!(!mint(&store, &creator, "LEGACYPAYPAL", "paypal", "pp_legacy", 2).await);
+        assert_unchanged(&before, &row("LEGACYPAYPAL").await);
+
+        assert!(mint(&store, &creator, "PAID", "stripe", "cs_paid", 1).await);
+        store
+            .mark_paid(&creator, "PAID", true, None, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        let before = row("PAID").await;
+        assert!(!mint(&store, &creator, "PAID", "stripe", "cs_replacement", 2).await);
+        assert_unchanged(&before, &row("PAID").await);
+
+        assert!(mint(&store, &creator, "REMINT", "stripe", "cs_old", 1).await);
+        assert!(mint(&store, &creator, "REMINT", "stripe", "cs_new", 2).await);
+        let reminted = row("REMINT").await;
+        assert_eq!(reminted.processor.as_deref(), Some("stripe"));
+        assert_eq!(reminted.session_id.as_deref(), Some("cs_new"));
+
+        assert!(mint(&store, &creator, "LEGACYSTRIPE", "stripe", "cs_legacy", 1).await);
+        make_legacy(&store, &creator, "LEGACYSTRIPE").await;
+        assert!(mint(&store, &creator, "LEGACYSTRIPE", "stripe", "cs_new", 2).await);
+        let rebound = row("LEGACYSTRIPE").await;
+        assert_eq!(rebound.processor.as_deref(), Some("stripe"));
+        assert_eq!(rebound.session_id.as_deref(), Some("cs_new"));
     }
 
     #[tokio::test]

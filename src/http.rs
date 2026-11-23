@@ -11,8 +11,9 @@
 //!   POST /webhooks/paypal         superseded by an API pull)
 //!   GET  /health
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -51,6 +52,56 @@ const SESSION_EXPIRY_SLACK_SECONDS: i64 = 60;
 /// PayPal's create-order response carries no expiry; orders are approvable
 /// for roughly three hours, so the recorded expiry mirrors that default.
 const PAYPAL_ORDER_TTL_SECONDS: i64 = 3 * 3600;
+const MAX_STATUS_PULL_CACHE_ENTRIES: usize = 10_000;
+
+type StatusPullKey = (String, String, String);
+
+/// Recent processor observations shared by status polls of the same session.
+#[derive(Default)]
+pub struct StatusPullCache {
+    entries: Mutex<HashMap<StatusPullKey, (PullOutcome, Instant)>>,
+}
+
+impl StatusPullCache {
+    fn key(correlation: &Correlation) -> Option<StatusPullKey> {
+        Some((
+            correlation.creator.clone(),
+            correlation.bundle_id.clone(),
+            correlation.session_id.clone()?,
+        ))
+    }
+
+    fn get(&self, correlation: &Correlation, freshness: Duration) -> Option<PullOutcome> {
+        if freshness.is_zero() {
+            return None;
+        }
+        let key = Self::key(correlation)?;
+        let mut entries = self.entries.lock().expect("status pull cache mutex");
+        let (outcome, pulled_at) = entries.get(&key).copied()?;
+        if Instant::now().saturating_duration_since(pulled_at) < freshness {
+            Some(outcome)
+        } else {
+            entries.remove(&key);
+            None
+        }
+    }
+
+    fn insert(&self, correlation: &Correlation, outcome: PullOutcome, freshness: Duration) {
+        if freshness.is_zero() || !matches!(outcome, PullOutcome::Paid { .. } | PullOutcome::Unpaid)
+        {
+            return;
+        }
+        let Some(key) = Self::key(correlation) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut entries = self.entries.lock().expect("status pull cache mutex");
+        entries.retain(|_, (_, pulled_at)| now.saturating_duration_since(*pulled_at) < freshness);
+        if entries.len() < MAX_STATUS_PULL_CACHE_ENTRIES || entries.contains_key(&key) {
+            entries.insert(key, (outcome, now));
+        }
+    }
+}
 
 pub struct AppState {
     pub trusted_key: VerifyingKey,
@@ -72,7 +123,12 @@ pub struct AppState {
     /// Exact `https://` origins a checkout request may name as
     /// `return_origin` (canonical `url::Url` serializations).
     pub buyer_return_origins: Vec<String>,
+    /// Charged only when a checkout request mints a new session.
     pub checkout_limiter: TokenBucket,
+    pub status_pull_cache: StatusPullCache,
+    pub status_pull_freshness: Duration,
+    /// Charged only by real processor pulls initiated by status requests.
+    pub status_pull_limiter: TokenBucket,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -293,7 +349,7 @@ fn return_urls(state: &AppState, return_origin: Option<&str>) -> (String, String
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn mint_session(
     state: &Arc<AppState>,
     kind: ProcessorKind,
@@ -375,7 +431,7 @@ async fn mint_session(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn mint_stripe_session(
     state: &Arc<AppState>,
     stripe: &Arc<StripeProcessor>,
@@ -436,14 +492,13 @@ async fn mint_stripe_session(
 
 /// The conditional persist of a just-minted session lost the race: between
 /// the pre-mint read and the UPDATE, a concurrent mint bound the correlation
-/// to a different return origin. The session we minted derives its redirect
-/// URLs from an origin the correlation is NOT bound to, so it is never
-/// served — re-read the winner instead. Choice (a) over (b): when the
-/// winning session is still live it is served, because the store guard
-/// makes it impossible for that session to carry URLs derived from anything
-/// but the now-bound origin — there is nothing to conflict about. Only a
-/// missing, expired, or no-longer-created row falls through to (b), a 409
-/// `invoice_conflict`.
+/// to a different return origin or processor, or the row left `created`.
+/// The session we minted is never served over that persisted state; re-read
+/// the winner instead. When the winning session is still live it is served,
+/// because the store guards keep its processor and derived redirect URLs
+/// consistent with the row. Only a missing, expired, or no-longer-created
+/// row falls through to a 409 `invoice_conflict`.
+#[allow(clippy::result_large_err)]
 async fn persisted_session_after_lost_race(
     state: &Arc<AppState>,
     creator: &str,
@@ -474,6 +529,29 @@ async fn persisted_session_after_lost_race(
         }
     }
     Err(ApiError::InvoiceConflict.into_response())
+}
+
+/// Returns a fresh cached observation, or spends the outbound budget on a
+/// real pull. `None` means the budget prevented the pull.
+async fn pull_for_status(
+    state: &Arc<AppState>,
+    correlation: &Correlation,
+    now: OffsetDateTime,
+) -> Option<PullOutcome> {
+    if let Some(outcome) = state
+        .status_pull_cache
+        .get(correlation, state.status_pull_freshness)
+    {
+        return Some(outcome);
+    }
+    if !state.status_pull_limiter.try_take() {
+        return None;
+    }
+    let outcome = pull_and_apply(&state.store, &state.processors, correlation, now).await;
+    state
+        .status_pull_cache
+        .insert(correlation, outcome, state.status_pull_freshness);
+    Some(outcome)
 }
 
 async fn transaction_status(
@@ -532,13 +610,17 @@ async fn transaction_status(
 
     // Opportunistic pull while awaiting payment: the Lock Server polls this
     // endpoint ~every 30s, which doubles as the payment observation loop, so
-    // fiat detection does not depend on webhook delivery at all.
+    // fiat detection does not depend on webhook delivery at all. A recent
+    // observation or an empty outbound budget skips the pull.
     let correlation =
         if correlation.state == CorrelationState::Created && correlation.session_id.is_some() {
-            pull_and_apply(&state.store, &state.processors, &correlation, now).await;
-            match state.store.get(&request.creator, &request.bundle_id).await {
-                Ok(Some(refreshed)) => refreshed,
-                _ => correlation,
+            if pull_for_status(&state, &correlation, now).await.is_some() {
+                match state.store.get(&request.creator, &request.bundle_id).await {
+                    Ok(Some(refreshed)) => refreshed,
+                    _ => correlation,
+                }
+            } else {
+                correlation
             }
         } else {
             correlation
@@ -556,20 +638,20 @@ async fn transaction_status(
     };
     let status = if correlation.state == CorrelationState::Confirmed {
         // `confirmed` is what releases the good, so it is only ever served
-        // on a fresh pull that still shows the payment unrefunded and
-        // undisputed. An unreadable processor holds at `detected`.
-        match pull_and_apply(&state.store, &state.processors, &correlation, now).await {
-            PullOutcome::Paid {
+        // on a pull no older than the freshness window that still shows the
+        // payment unrefunded and undisputed. An unreadable processor or an
+        // empty outbound budget holds at `detected`.
+        match pull_for_status(&state, &correlation, now).await {
+            Some(PullOutcome::Paid {
                 amount_matched: true,
-            } => confirmed,
-            PullOutcome::Reversed => undetected,
-            PullOutcome::Paid { .. } | PullOutcome::Unpaid | PullOutcome::Unavailable => {
-                crate::wire::TransactionStatus {
-                    status: crate::wire::StatusKind::Detected,
-                    confirmations: 0,
-                    amount_matched: correlation.amount_matched,
-                }
-            }
+            }) => confirmed,
+            Some(PullOutcome::Reversed) => undetected,
+            Some(PullOutcome::Paid { .. } | PullOutcome::Unpaid | PullOutcome::Unavailable)
+            | None => crate::wire::TransactionStatus {
+                status: crate::wire::StatusKind::Detected,
+                confirmations: 0,
+                amount_matched: correlation.amount_matched,
+            },
         }
     } else {
         match report(
@@ -580,7 +662,14 @@ async fn transaction_status(
         ) {
             Report::Immediate(status) => status,
             Report::PromotionDue { fallback } => {
-                if promote_if_still_paid(&state.store, &state.processors, &correlation, now).await {
+                // Promotion advances state and therefore always needs a real
+                // pull; it never reads the status cache.
+                let promoted = if state.status_pull_limiter.try_take() {
+                    promote_if_still_paid(&state.store, &state.processors, &correlation, now).await
+                } else {
+                    false
+                };
+                if promoted {
                     confirmed
                 } else {
                     match state.store.get(&request.creator, &request.bundle_id).await {
@@ -600,9 +689,6 @@ async fn checkout_session(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CheckoutSessionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if !state.checkout_limiter.try_take() {
-        return ApiError::RateLimited.into_response();
-    }
     let Ok(Json(request)) = body else {
         return ApiError::InvalidRequest.into_response();
     };
@@ -696,6 +782,9 @@ async fn checkout_session(
     }
     // Session expired (or was never minted / never fully persisted), or a
     // return origin is being bound for the first time: mint.
+    if !state.checkout_limiter.try_take() {
+        return ApiError::RateLimited.into_response();
+    }
     match mint_session(
         &state,
         kind,
