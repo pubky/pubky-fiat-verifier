@@ -100,6 +100,10 @@ pub struct Config {
     /// Outbound processor-pull budget shared by status requests.
     pub status_pull_rate_per_second: u64,
     pub status_pull_rate_burst: u64,
+    /// Outbound pull budget reserved for status requests that re-check a
+    /// confirmed payment or promote a paid one.
+    pub settlement_pull_rate_per_second: u64,
+    pub settlement_pull_rate_burst: u64,
 }
 
 impl Config {
@@ -285,6 +289,8 @@ impl Config {
             )?),
             status_pull_rate_per_second: parse_u64("FIAT_STATUS_PULL_RATE_PER_SECOND", 10)?,
             status_pull_rate_burst: parse_u64("FIAT_STATUS_PULL_RATE_BURST", 50)?,
+            settlement_pull_rate_per_second: parse_u64("FIAT_SETTLEMENT_PULL_RATE_PER_SECOND", 5)?,
+            settlement_pull_rate_burst: parse_u64("FIAT_SETTLEMENT_PULL_RATE_BURST", 20)?,
         })
     }
 }

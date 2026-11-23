@@ -175,6 +175,7 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket charged only when `/checkout-sessions` mints a session; rejected bodies and live-session reuse spend nothing. |
 | `FIAT_STATUS_PULL_FRESHNESS_SECONDS` | no | `15` | How long status polls may reuse a paid or unpaid processor observation for the same session. `0` disables reuse. |
 | `FIAT_STATUS_PULL_RATE_PER_SECOND` / `FIAT_STATUS_PULL_RATE_BURST` | no | `10` / `50` | Outbound token bucket shared by real processor pulls from status requests. Cache hits, webhook corroboration pulls, and poll-worker pulls spend nothing. |
+| `FIAT_SETTLEMENT_PULL_RATE_PER_SECOND` / `FIAT_SETTLEMENT_PULL_RATE_BURST` | no | `5` / `20` | Outbound token bucket reserved for status pulls that re-check a confirmed payment or promote a paid one; those fall back to the shared bucket once this one is empty. Polls of unpaid checkouts never draw from it, so open unpaid sessions cannot starve settlement. A pull refused for budget logs a warning at most once a minute, with refusal counts. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
 
 ## Runbook

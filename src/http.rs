@@ -129,6 +129,86 @@ pub struct AppState {
     pub status_pull_freshness: Duration,
     /// Charged only by real processor pulls initiated by status requests.
     pub status_pull_limiter: TokenBucket,
+    /// Reserved for status pulls that can serve or grant `confirmed`
+    /// (confirmed rows and promotion), which fall back to
+    /// `status_pull_limiter` once it is empty. Pulls of `created` rows never
+    /// draw from it, so open unpaid sessions cannot starve settlement.
+    pub settlement_pull_limiter: TokenBucket,
+    pub pull_budget_refusals: RefusalLog,
+}
+
+/// Which status pull is asking for outbound budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusPullPurpose {
+    /// Payment detection for a `created` row.
+    Detection,
+    /// Re-checking a `confirmed` row, or promoting a `paid` one.
+    Settlement,
+}
+
+impl StatusPullPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detection => "detection",
+            Self::Settlement => "settlement",
+        }
+    }
+}
+
+const REFUSAL_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Counts status pulls refused for budget and logs at most one warning per
+/// interval, so a sustained shortfall stays visible without flooding logs.
+#[derive(Default)]
+pub struct RefusalLog {
+    inner: Mutex<RefusalCounts>,
+}
+
+#[derive(Default)]
+struct RefusalCounts {
+    last_warning: Option<Instant>,
+    detection: u64,
+    settlement: u64,
+}
+
+impl RefusalLog {
+    fn record(&self, purpose: StatusPullPurpose) {
+        let mut counts = self.inner.lock().expect("refusal log mutex");
+        match purpose {
+            StatusPullPurpose::Detection => counts.detection += 1,
+            StatusPullPurpose::Settlement => counts.settlement += 1,
+        }
+        let now = Instant::now();
+        if counts
+            .last_warning
+            .is_some_and(|last| now.saturating_duration_since(last) < REFUSAL_WARNING_INTERVAL)
+        {
+            return;
+        }
+        tracing::warn!(
+            purpose = purpose.as_str(),
+            refused_detection = counts.detection,
+            refused_settlement = counts.settlement,
+            "status processor pull refused: outbound pull budget is empty"
+        );
+        counts.last_warning = Some(now);
+        counts.detection = 0;
+        counts.settlement = 0;
+    }
+}
+
+/// Spends outbound budget for one status-initiated processor pull.
+fn take_status_pull(state: &AppState, purpose: StatusPullPurpose) -> bool {
+    let granted = match purpose {
+        StatusPullPurpose::Detection => state.status_pull_limiter.try_take(),
+        StatusPullPurpose::Settlement => {
+            state.settlement_pull_limiter.try_take() || state.status_pull_limiter.try_take()
+        }
+    };
+    if !granted {
+        state.pull_budget_refusals.record(purpose);
+    }
+    granted
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -536,6 +616,7 @@ async fn persisted_session_after_lost_race(
 async fn pull_for_status(
     state: &Arc<AppState>,
     correlation: &Correlation,
+    purpose: StatusPullPurpose,
     now: OffsetDateTime,
 ) -> Option<PullOutcome> {
     if let Some(outcome) = state
@@ -544,7 +625,7 @@ async fn pull_for_status(
     {
         return Some(outcome);
     }
-    if !state.status_pull_limiter.try_take() {
+    if !take_status_pull(state, purpose) {
         return None;
     }
     let outcome = pull_and_apply(&state.store, &state.processors, correlation, now).await;
@@ -614,7 +695,10 @@ async fn transaction_status(
     // observation or an empty outbound budget skips the pull.
     let correlation =
         if correlation.state == CorrelationState::Created && correlation.session_id.is_some() {
-            if pull_for_status(&state, &correlation, now).await.is_some() {
+            if pull_for_status(&state, &correlation, StatusPullPurpose::Detection, now)
+                .await
+                .is_some()
+            {
                 match state.store.get(&request.creator, &request.bundle_id).await {
                     Ok(Some(refreshed)) => refreshed,
                     _ => correlation,
@@ -641,7 +725,7 @@ async fn transaction_status(
         // on a pull no older than the freshness window that still shows the
         // payment unrefunded and undisputed. An unreadable processor or an
         // empty outbound budget holds at `detected`.
-        match pull_for_status(&state, &correlation, now).await {
+        match pull_for_status(&state, &correlation, StatusPullPurpose::Settlement, now).await {
             Some(PullOutcome::Paid {
                 amount_matched: true,
             }) => confirmed,
@@ -664,7 +748,7 @@ async fn transaction_status(
             Report::PromotionDue { fallback } => {
                 // Promotion advances state and therefore always needs a real
                 // pull; it never reads the status cache.
-                let promoted = if state.status_pull_limiter.try_take() {
+                let promoted = if take_status_pull(&state, StatusPullPurpose::Settlement) {
                     promote_if_still_paid(&state.store, &state.processors, &correlation, now).await
                 } else {
                     false

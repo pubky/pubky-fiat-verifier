@@ -24,7 +24,7 @@ use sha2::Sha256;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
-use crate::http::{router, AppState, StatusPullCache};
+use crate::http::{router, AppState, RefusalLog, StatusPullCache};
 use crate::lock_fetch::{CriterionSource, LockCriterion, LockFetchError};
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -666,6 +666,9 @@ struct HarnessOptions {
     status_pull_freshness: Duration,
     /// (rate per second, burst) of the status processor-pull limiter.
     status_pull_bucket: (u64, u64),
+    /// (rate per second, burst) of the pull budget reserved for confirmed
+    /// polls and promotion.
+    settlement_pull_bucket: (u64, u64),
 }
 
 impl Default for HarnessOptions {
@@ -678,6 +681,7 @@ impl Default for HarnessOptions {
             checkout_bucket: (100, 100),
             status_pull_freshness: Duration::from_secs(15),
             status_pull_bucket: (1000, 1000),
+            settlement_pull_bucket: (1000, 1000),
         }
     }
 }
@@ -822,6 +826,11 @@ async fn build_harness_with_store(
             options.status_pull_bucket.0,
             options.status_pull_bucket.1,
         ),
+        settlement_pull_limiter: TokenBucket::new(
+            options.settlement_pull_bucket.0,
+            options.settlement_pull_bucket.1,
+        ),
+        pull_budget_refusals: RefusalLog::default(),
     });
     let base = spawn(router(state)).await;
     Harness {
@@ -2780,6 +2789,7 @@ async fn status_poll_with_an_empty_pull_budget_holds_a_confirmed_purchase_at_det
     let harness = build_harness(HarnessOptions {
         status_pull_freshness: Duration::ZERO,
         status_pull_bucket: (0, 1),
+        settlement_pull_bucket: (0, 0),
         ..HarnessOptions::default()
     })
     .await;
@@ -3016,4 +3026,43 @@ async fn a_reversal_written_during_promotion_is_never_confirmed_postgres_store()
         OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
     reversal_between_promotion_pull_and_update_is_never_confirmed(Arc::new(store), &bundle).await;
+}
+
+#[tokio::test]
+async fn open_unpaid_sessions_cannot_starve_promotion_of_a_paid_purchase() {
+    let harness = build_harness(HarnessOptions {
+        status_pull_bucket: (0, 1),
+        settlement_pull_bucket: (0, 1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    paid_past_settlement_delay(&harness, BUNDLE).await;
+    for bundle in ["UNPAIDBUNDLE1", "UNPAIDBUNDLE2"] {
+        assert_eq!(harness.invoice("usd", bundle).await.status().as_u16(), 204);
+    }
+
+    let reads = || {
+        harness
+            .stripe_mock
+            .session_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = reads();
+    assert_eq!(
+        harness.status("UNPAIDBUNDLE1").await["status"],
+        "undetected"
+    );
+    assert_eq!(reads(), before + 1);
+    // The shared budget is now empty: further detection polls skip the pull.
+    assert_eq!(
+        harness.status("UNPAIDBUNDLE2").await["status"],
+        "undetected"
+    );
+    assert_eq!(reads(), before + 1);
+
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "confirmed", "confirmations": 1, "amount_matched": true})
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
 }

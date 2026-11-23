@@ -18,7 +18,7 @@ mod worker;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::http::{AppState, StatusPullCache};
+use crate::http::{AppState, RefusalLog, StatusPullCache};
 use crate::lock_fetch::PubkyCriterionSource;
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -124,6 +124,11 @@ async fn main() {
             config.status_pull_rate_per_second,
             config.status_pull_rate_burst,
         ),
+        settlement_pull_limiter: TokenBucket::new(
+            config.settlement_pull_rate_per_second,
+            config.settlement_pull_rate_burst,
+        ),
+        pull_budget_refusals: RefusalLog::default(),
     });
 
     tracing::info!(
