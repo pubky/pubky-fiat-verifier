@@ -132,13 +132,15 @@ pub trait CorrelationStore: Send + Sync {
     ) -> Result<(), StoreError>;
     /// Promotes paid -> confirmed. No-op unless current state is `paid`.
     /// Promotion only follows a fresh pull, so it also counts as the first
-    /// reversal check.
+    /// reversal check. Returns `true` only when this call moved the row; a
+    /// row a concurrent writer already moved (for example to `reversed`)
+    /// returns `false`.
     async fn mark_confirmed(
         &self,
         creator: &str,
         bundle_id: &str,
         confirmed_at: OffsetDateTime,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
     /// Marks created/paid/confirmed -> reversed (verified reversal only).
     async fn mark_reversed(
         &self,
@@ -386,8 +388,8 @@ impl CorrelationStore for PostgresStore {
         creator: &str,
         bundle_id: &str,
         confirmed_at: OffsetDateTime,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             "UPDATE correlations SET state = 'confirmed', confirmed_at = $3, \
              reversal_checked_at = $3, updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2 AND state = 'paid'",
@@ -398,7 +400,7 @@ impl CorrelationStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     async fn mark_reversed(
@@ -694,19 +696,21 @@ pub mod memory {
             creator: &str,
             bundle_id: &str,
             confirmed_at: OffsetDateTime,
-        ) -> Result<(), StoreError> {
+        ) -> Result<bool, StoreError> {
             let key = (creator.to_owned(), bundle_id.to_owned());
             let mut rows = self.rows.lock().unwrap();
-            if let Some(row) = rows.get_mut(&key) {
-                if row.state == CorrelationState::Paid {
-                    row.state = CorrelationState::Confirmed;
-                    let mut meta = self.meta.lock().unwrap();
-                    let meta = meta.entry(key).or_default();
-                    meta.confirmed_at = Some(confirmed_at);
-                    meta.reversal_checked_at = Some(confirmed_at);
-                }
+            let Some(row) = rows.get_mut(&key) else {
+                return Ok(false);
+            };
+            if row.state != CorrelationState::Paid {
+                return Ok(false);
             }
-            Ok(())
+            row.state = CorrelationState::Confirmed;
+            let mut meta = self.meta.lock().unwrap();
+            let meta = meta.entry(key).or_default();
+            meta.confirmed_at = Some(confirmed_at);
+            meta.reversal_checked_at = Some(confirmed_at);
+            Ok(true)
         }
 
         async fn mark_reversed(
@@ -938,6 +942,39 @@ pub mod memory {
             assert_eq!(rebound.processor.as_deref(), Some("stripe"));
             assert_eq!(rebound.session_id.as_deref(), Some("cs_new"));
         }
+
+        #[tokio::test]
+        async fn mark_confirmed_reports_whether_the_row_moved() {
+            let store = MemoryStore::default();
+            let now = OffsetDateTime::now_utc();
+            for bundle in ["PROMOTE", "REVERSED"] {
+                insert(&store, bundle).await;
+                assert!(mint(&store, bundle, "stripe", "cs_1", 1).await);
+                store
+                    .mark_paid(CREATOR, bundle, true, None, now)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(store.mark_confirmed(CREATOR, "PROMOTE", now).await.unwrap());
+            assert!(!store.mark_confirmed(CREATOR, "PROMOTE", now).await.unwrap());
+            assert_eq!(
+                row(&store, "PROMOTE").await.state,
+                CorrelationState::Confirmed
+            );
+
+            store.mark_reversed(CREATOR, "REVERSED", now).await.unwrap();
+            assert!(!store
+                .mark_confirmed(CREATOR, "REVERSED", now)
+                .await
+                .unwrap());
+            assert_eq!(
+                row(&store, "REVERSED").await.state,
+                CorrelationState::Reversed
+            );
+            assert!(store.meta(CREATOR, "REVERSED").confirmed_at.is_none());
+            assert!(!store.mark_confirmed(CREATOR, "MISSING", now).await.unwrap());
+        }
     }
 }
 
@@ -945,7 +982,7 @@ pub mod memory {
 /// `FIAT_TEST_DATABASE_URL` is set (CI provides a Postgres service); rows
 /// use a per-run creator so runs never interfere.
 #[cfg(test)]
-mod postgres_tests {
+pub(crate) mod postgres_tests {
     use std::time::Duration;
 
     use super::*;
@@ -954,7 +991,7 @@ mod postgres_tests {
     /// Postgres, so the tests bootstrap the schema one at a time.
     static BOOTSTRAP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn store() -> Option<PostgresStore> {
+    pub(crate) async fn store() -> Option<PostgresStore> {
         let Ok(url) = std::env::var("FIAT_TEST_DATABASE_URL") else {
             eprintln!("FIAT_TEST_DATABASE_URL unset: skipping the Postgres store test");
             return None;
@@ -1078,7 +1115,7 @@ mod postgres_tests {
 
         // Confirmed: the confirmation counts as the first check.
         paid_row(&store, &creator, "LATE", now).await;
-        store.mark_confirmed(&creator, "LATE", now).await.unwrap();
+        assert!(store.mark_confirmed(&creator, "LATE", now).await.unwrap());
         assert!(mine(
             store
                 .confirmed_due_for_reversal_check(now - day, now - Duration::from_secs(1))
@@ -1213,6 +1250,56 @@ mod postgres_tests {
         let rebound = row("LEGACYSTRIPE").await;
         assert_eq!(rebound.processor.as_deref(), Some("stripe"));
         assert_eq!(rebound.session_id.as_deref(), Some("cs_new"));
+    }
+
+    #[tokio::test]
+    async fn mark_confirmed_reports_whether_the_row_moved() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+            .unwrap();
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        paid_row(&store, &creator, "PROMOTE", now).await;
+        paid_row(&store, &creator, "REVERSED", now).await;
+
+        assert!(store
+            .mark_confirmed(&creator, "PROMOTE", now)
+            .await
+            .unwrap());
+        assert!(!store
+            .mark_confirmed(&creator, "PROMOTE", now)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(&creator, "PROMOTE").await.unwrap().unwrap().state,
+            CorrelationState::Confirmed
+        );
+
+        store
+            .mark_reversed(&creator, "REVERSED", now)
+            .await
+            .unwrap();
+        assert!(!store
+            .mark_confirmed(&creator, "REVERSED", now)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get(&creator, "REVERSED")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CorrelationState::Reversed
+        );
+        assert!(!store
+            .mark_confirmed(&creator, "MISSING", now)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

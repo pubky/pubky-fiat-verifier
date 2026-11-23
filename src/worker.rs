@@ -92,17 +92,23 @@ async fn poll_open(
         if refreshed.state == CorrelationState::Paid {
             if let Some(paid_at) = refreshed.paid_at {
                 if now >= paid_at + settlement_delay {
-                    if let Err(error) = store
+                    match store
                         .mark_confirmed(&refreshed.creator, &refreshed.bundle_id, now)
                         .await
                     {
-                        tracing::error!(%error, "poll worker failed to persist confirmation");
-                    } else {
-                        tracing::info!(
+                        Ok(true) => tracing::info!(
                             creator = %refreshed.creator,
                             bundle_id = %refreshed.bundle_id,
                             "fiat payment confirmed by poll worker (delay elapsed, pull verified)"
-                        );
+                        ),
+                        Ok(false) => tracing::info!(
+                            creator = %refreshed.creator,
+                            bundle_id = %refreshed.bundle_id,
+                            "poll worker promotion skipped: the correlation is no longer paid"
+                        ),
+                        Err(error) => {
+                            tracing::error!(%error, "poll worker failed to persist confirmation");
+                        }
                     }
                 }
             }

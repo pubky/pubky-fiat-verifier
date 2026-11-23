@@ -30,7 +30,10 @@ use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
 use crate::rate_limit::TokenBucket;
 use crate::store::memory::MemoryStore;
-use crate::store::{CorrelationState, CorrelationStore};
+use crate::store::{
+    Correlation, CorrelationState, CorrelationStore, InsertOutcome, NewCorrelation,
+    ReversalOutcome, StoreError,
+};
 use crate::stripe::StripeProcessor;
 use crate::verification::{ProcessorKind, Processors};
 use crate::worker::ReversalWatch;
@@ -689,6 +692,15 @@ async fn spawn(app: Router) -> String {
 }
 
 async fn build_harness(options: HarnessOptions) -> Harness {
+    build_harness_with_store(options, None).await
+}
+
+/// `store` replaces the in-memory store the router and worker use; the
+/// `memory` handle then stays empty.
+async fn build_harness_with_store(
+    options: HarnessOptions,
+    store: Option<Arc<dyn CorrelationStore>>,
+) -> Harness {
     let stripe_mock = MockStripe::default();
     let stripe_url = spawn(
         Router::new()
@@ -767,7 +779,7 @@ async fn build_harness(options: HarnessOptions) -> Harness {
     );
 
     let memory = Arc::new(MemoryStore::default());
-    let store: Arc<dyn CorrelationStore> = memory.clone();
+    let store: Arc<dyn CorrelationStore> = store.unwrap_or_else(|| memory.clone());
     let processors = Arc::new(Processors {
         stripe: options.with_stripe.then(|| {
             Arc::new(StripeProcessor::new(
@@ -2835,4 +2847,173 @@ async fn a_refund_seen_after_the_freshness_window_flips_the_status() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
     assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
+}
+
+/// Delegates to `inner`, but writes a reversal immediately before every
+/// promotion: the interleaving in which a webhook or the poll worker records
+/// a refund between a clean promotion pull and the `paid -> confirmed`
+/// update.
+struct ReversalBeforeConfirm {
+    inner: Arc<dyn CorrelationStore>,
+}
+
+#[async_trait]
+impl CorrelationStore for ReversalBeforeConfirm {
+    async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError> {
+        self.inner.insert_new(new).await
+    }
+    async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError> {
+        self.inner.get(creator, bundle_id).await
+    }
+    async fn set_session(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        processor: &str,
+        session_id: &str,
+        checkout_url: &str,
+        checkout_expires_at: i64,
+        session_attempt: i32,
+        return_origin: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .set_session(
+                creator,
+                bundle_id,
+                processor,
+                session_id,
+                checkout_url,
+                checkout_expires_at,
+                session_attempt,
+                return_origin,
+            )
+            .await
+    }
+    async fn mark_paid(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        amount_matched: bool,
+        payment_intent: Option<&str>,
+        paid_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .mark_paid(creator, bundle_id, amount_matched, payment_intent, paid_at)
+            .await
+    }
+    async fn mark_confirmed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        confirmed_at: OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .mark_reversed(creator, bundle_id, confirmed_at)
+            .await?;
+        self.inner
+            .mark_confirmed(creator, bundle_id, confirmed_at)
+            .await
+    }
+    async fn mark_reversed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        reversed_at: OffsetDateTime,
+    ) -> Result<ReversalOutcome, StoreError> {
+        self.inner
+            .mark_reversed(creator, bundle_id, reversed_at)
+            .await
+    }
+    async fn find_by_payment_intent(
+        &self,
+        payment_intent: &str,
+    ) -> Result<Option<Correlation>, StoreError> {
+        self.inner.find_by_payment_intent(payment_intent).await
+    }
+    async fn record_webhook_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.record_webhook_event(event_id, event_type).await
+    }
+    async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        self.inner.forget_webhook_event(event_id).await
+    }
+    async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
+        self.inner.open_fiat_correlations().await
+    }
+    async fn confirmed_due_for_reversal_check(
+        &self,
+        confirmed_after: OffsetDateTime,
+        checked_before: OffsetDateTime,
+    ) -> Result<Vec<Correlation>, StoreError> {
+        self.inner
+            .confirmed_due_for_reversal_check(confirmed_after, checked_before)
+            .await
+    }
+    async fn mark_reversal_checked(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .mark_reversal_checked(creator, bundle_id, checked_at)
+            .await
+    }
+    async fn healthy(&self) -> bool {
+        self.inner.healthy().await
+    }
+}
+
+/// A Stripe purchase recorded paid long enough ago that the next status
+/// request is due for promotion.
+async fn paid_past_settlement_delay(harness: &Harness, bundle: &str) {
+    assert_eq!(harness.invoice("usd", bundle).await.status().as_u16(), 204);
+    harness.stripe_mock.set_payment_status("cs_test_1", "paid");
+    let paid_at = OffsetDateTime::now_utc() - harness.settlement_delay - Duration::from_secs(60);
+    harness
+        .store
+        .mark_paid(CREATOR, bundle, true, Some("pi_cs_test_1"), paid_at)
+        .await
+        .unwrap();
+    assert_eq!(harness.state(bundle).await, CorrelationState::Paid);
+}
+
+async fn reversal_between_promotion_pull_and_update_is_never_confirmed(
+    inner: Arc<dyn CorrelationStore>,
+    bundle: &str,
+) {
+    let store: Arc<dyn CorrelationStore> = Arc::new(ReversalBeforeConfirm { inner });
+    let harness = build_harness_with_store(HarnessOptions::default(), Some(store)).await;
+    paid_past_settlement_delay(&harness, bundle).await;
+
+    assert_eq!(
+        harness.status(bundle).await,
+        json!({"status": "undetected", "confirmations": 0, "amount_matched": false})
+    );
+    assert_eq!(harness.state(bundle).await, CorrelationState::Reversed);
+    assert_eq!(harness.status(bundle).await["status"], "undetected");
+}
+
+#[tokio::test]
+async fn a_reversal_written_during_promotion_is_never_confirmed_memory_store() {
+    reversal_between_promotion_pull_and_update_is_never_confirmed(
+        Arc::new(MemoryStore::default()),
+        BUNDLE,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_reversal_written_during_promotion_is_never_confirmed_postgres_store() {
+    let Some(store) = crate::store::postgres_tests::store().await else {
+        return;
+    };
+    let bundle = format!(
+        "PROMOTIONRACE{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    reversal_between_promotion_pull_and_update_is_never_confirmed(Arc::new(store), &bundle).await;
 }

@@ -372,7 +372,10 @@ async fn pull_paypal(paypal: &PaypalProcessor, correlation: &Correlation) -> Pul
 }
 
 /// Fresh-pull promotion: only called once the settlement delay has elapsed.
-/// Reports `true` (promote) only if the pull still says paid + matched.
+/// Reports `true` (promote) only if the pull still says paid + matched and
+/// this call moved the row from `paid` to `confirmed`. A row a webhook or the
+/// poll worker moved in the meantime (for example to `reversed`) is not
+/// promoted; the caller must answer from the stored state.
 pub async fn promote_if_still_paid(
     store: &Arc<dyn CorrelationStore>,
     processors: &Processors,
@@ -383,12 +386,23 @@ pub async fn promote_if_still_paid(
         PullOutcome::Paid {
             amount_matched: true,
         } => {
-            if let Err(error) = store
+            match store
                 .mark_confirmed(&correlation.creator, &correlation.bundle_id, now)
                 .await
             {
-                tracing::error!(%error, "failed to persist confirmation");
-                return false;
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        creator = %correlation.creator,
+                        bundle_id = %correlation.bundle_id,
+                        "promotion skipped: the correlation is no longer paid"
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist confirmation");
+                    return false;
+                }
             }
             tracing::info!(
                 creator = %correlation.creator,
