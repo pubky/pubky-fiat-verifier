@@ -2048,7 +2048,7 @@ fn spawn_plain_checkout(base: &str) -> tokio::task::JoinHandle<reqwest::Response
     })
 }
 
-// F1 regression: a no-origin mint that read the row before a concurrent
+// Regression: a no-origin mint that read the row before a concurrent
 // origin-A mint persisted must never clobber the A binding with its
 // static-fallback session. The gate parks the no-origin mint inside the
 // mock create, guaranteeing the interleaving under test: loser read +
