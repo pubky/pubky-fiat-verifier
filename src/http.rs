@@ -86,7 +86,15 @@ impl StatusPullCache {
         }
     }
 
-    fn insert(&self, correlation: &Correlation, outcome: PullOutcome, freshness: Duration) {
+    /// `pulled_at` is taken before the pull starts, so an observation never
+    /// outlives the window by the pull's own duration.
+    fn insert(
+        &self,
+        correlation: &Correlation,
+        outcome: PullOutcome,
+        pulled_at: Instant,
+        freshness: Duration,
+    ) {
         if freshness.is_zero() || !matches!(outcome, PullOutcome::Paid { .. } | PullOutcome::Unpaid)
         {
             return;
@@ -96,9 +104,23 @@ impl StatusPullCache {
         };
         let now = Instant::now();
         let mut entries = self.entries.lock().expect("status pull cache mutex");
-        entries.retain(|_, (_, pulled_at)| now.saturating_duration_since(*pulled_at) < freshness);
+        entries.retain(|_, (_, at)| now.saturating_duration_since(*at) < freshness);
+        if now.saturating_duration_since(pulled_at) >= freshness {
+            return;
+        }
         if entries.len() < MAX_STATUS_PULL_CACHE_ENTRIES || entries.contains_key(&key) {
-            entries.insert(key, (outcome, now));
+            entries.insert(key, (outcome, pulled_at));
+        }
+    }
+
+    /// Makes every cached observation `by` older.
+    #[cfg(test)]
+    pub fn age_entries(&self, by: Duration) {
+        let mut entries = self.entries.lock().expect("status pull cache mutex");
+        for (_, pulled_at) in entries.values_mut() {
+            *pulled_at = pulled_at
+                .checked_sub(by)
+                .expect("test clock offset stays within the monotonic clock range");
         }
     }
 }
@@ -628,10 +650,11 @@ async fn pull_for_status(
     if !take_status_pull(state, purpose) {
         return None;
     }
+    let pulled_at = Instant::now();
     let outcome = pull_and_apply(&state.store, &state.processors, correlation, now).await;
     state
         .status_pull_cache
-        .insert(correlation, outcome, state.status_pull_freshness);
+        .insert(correlation, outcome, pulled_at, state.status_pull_freshness);
     Some(outcome)
 }
 
@@ -1340,4 +1363,49 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn correlation(session_id: &str) -> Correlation {
+        Correlation {
+            creator: "pubkycreator".to_owned(),
+            bundle_id: "BUNDLE".to_owned(),
+            lock_resource: "pubkycreator/pub/locks.app/usd.json".to_owned(),
+            reader: "pubkyreader".to_owned(),
+            asset: "USD".to_owned(),
+            amount_minor: 1999,
+            state: CorrelationState::Confirmed,
+            processor: Some("stripe".to_owned()),
+            session_id: Some(session_id.to_owned()),
+            checkout_url: None,
+            checkout_expires_at: None,
+            return_origin: None,
+            session_attempt: 1,
+            payment_intent: None,
+            amount_matched: true,
+            paid_at: None,
+        }
+    }
+
+    #[test]
+    fn cached_observations_age_from_when_the_pull_started() {
+        let freshness = Duration::from_secs(15);
+        let paid = PullOutcome::Paid {
+            amount_matched: true,
+        };
+        let cache = StatusPullCache::default();
+        let started = Instant::now() - Duration::from_secs(10);
+
+        cache.insert(&correlation("cs_1"), paid, started, freshness);
+        assert_eq!(cache.get(&correlation("cs_1"), freshness), Some(paid));
+        cache.age_entries(Duration::from_secs(5));
+        assert_eq!(cache.get(&correlation("cs_1"), freshness), None);
+
+        let expired_by_the_pull = Instant::now() - freshness;
+        cache.insert(&correlation("cs_2"), paid, expired_by_the_pull, freshness);
+        assert_eq!(cache.get(&correlation("cs_2"), freshness), None);
+    }
 }

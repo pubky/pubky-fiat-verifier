@@ -70,10 +70,12 @@ not a second backend: one URL, all rails. Cutover is an operator env change
   (default `stripe`).
 - **The binding is permanent.** Once a session/order is minted, the correlation's
   processor never changes — a later `/checkout-sessions` naming the other processor
-  gets `409`. Reason, stated honestly: switching would leave a still-payable
-  session on the abandoned processor whose payment this gateway would no longer
-  observe; refusing the switch is the fail-closed option. Expired sessions re-mint
-  on the same processor.
+  gets `409`. Of two concurrent first checkouts naming different processors, the
+  first persisted session wins; the other request is answered with that live
+  session (which names the winning processor) or `409`. Reason, stated honestly:
+  switching would leave a still-payable session on the abandoned processor whose
+  payment this gateway would no longer observe; refusing the switch is the
+  fail-closed option. Expired sessions re-mint on the same processor.
 
 ### The PayPal order lifecycle
 
@@ -93,9 +95,11 @@ validity; the create response carries no expiry field).
 | --- | --- |
 | created (no completed checkout) | `undetected, 0, false` |
 | paid (API pull verified), inside settlement delay | `detected, 0, amount_matched` |
-| paid, delay elapsed, fresh re-pull still paid and not refunded or disputed | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| paid, delay elapsed, fresh re-pull still paid and not refunded or disputed, and the row still `paid` when the promotion is written | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| paid, delay elapsed, but the status-pull budget is empty | `detected, 0, amount_matched` (promotion waits for budget or the poll worker) |
 | confirmed, pull within the freshness window still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
 | confirmed, processor unreadable or the status-pull budget is empty | `detected, 0, true` (held, never served blind) |
+| created, status-pull budget empty | `undetected, 0, false` (the pull is skipped; webhooks and the poll worker still detect payment) |
 | reversed — refunded (fully or partially) or disputed, pull-verified, before or after confirmation | `undetected, 0, false` |
 
 **What "paid" means.** A Stripe Checkout Session keeps `payment_status: paid` after a
@@ -173,10 +177,12 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_REVERSAL_WATCH_DAYS` | no | `180` | How long after confirmation the poll worker keeps re-checking for a refund or dispute (1–3650). The default covers PayPal's 180-day dispute window; Stripe card disputes arrive within 120 days. |
 | `FIAT_REVERSAL_RECHECK_SECONDS` | no | `3600` | Minimum time between two reversal checks of one confirmed payment. Each Stripe check costs two API reads (session and PaymentIntent), each PayPal check two (order and disputes). |
 | `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket charged only when `/checkout-sessions` mints a session; rejected bodies and live-session reuse spend nothing. |
-| `FIAT_STATUS_PULL_FRESHNESS_SECONDS` | no | `15` | How long status polls may reuse a paid or unpaid processor observation for the same session. `0` disables reuse. |
-| `FIAT_STATUS_PULL_RATE_PER_SECOND` / `FIAT_STATUS_PULL_RATE_BURST` | no | `10` / `50` | Outbound token bucket shared by real processor pulls from status requests. Cache hits, webhook corroboration pulls, and poll-worker pulls spend nothing. |
-| `FIAT_SETTLEMENT_PULL_RATE_PER_SECOND` / `FIAT_SETTLEMENT_PULL_RATE_BURST` | no | `5` / `20` | Outbound token bucket reserved for status pulls that re-check a confirmed payment or promote a paid one; those fall back to the shared bucket once this one is empty. Polls of unpaid checkouts never draw from it, so open unpaid sessions cannot starve settlement. A pull refused for budget logs a warning at most once a minute, with refusal counts. |
+| `FIAT_STATUS_PULL_FRESHNESS_SECONDS` | no | `15` | How long status polls may reuse a paid or unpaid processor observation for the same session, counted from when the pull started. `0` disables reuse; values above `60` refuse to boot, since the window bounds how old the observation behind a `confirmed` answer can be. |
+| `FIAT_STATUS_PULL_RATE_PER_SECOND` / `FIAT_STATUS_PULL_RATE_BURST` | no | `10` / `50` | Outbound token bucket shared by real processor pulls from status requests. Cache hits, webhook corroboration pulls, and poll-worker pulls spend nothing. Both values must be positive (`0` refuses to boot). |
+| `FIAT_SETTLEMENT_PULL_RATE_PER_SECOND` / `FIAT_SETTLEMENT_PULL_RATE_BURST` | no | `5` / `20` | Outbound token bucket reserved for status pulls that re-check a confirmed payment or promote a paid one; those fall back to the shared bucket once this one is empty. Polls of unpaid checkouts never draw from it, so open unpaid sessions cannot starve settlement. A pull refused for budget logs a warning at most once a minute, with refusal counts. Both values must be positive. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
+
+The status cache and both pull buckets live in process memory: each replica keeps its own, so the outbound pull rate scales with the replica count. With an empty budget, polls of unpaid checkouts skip the pull and promotion waits; neither ever advances state without a pull.
 
 ## Runbook
 

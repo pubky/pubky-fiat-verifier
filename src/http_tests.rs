@@ -653,6 +653,7 @@ struct Harness {
     paykit_mock: MockPaykit,
     http: reqwest::Client,
     settlement_delay: Duration,
+    app: Arc<AppState>,
 }
 
 #[derive(Clone, Copy)]
@@ -832,8 +833,9 @@ async fn build_harness_with_store(
         ),
         pull_budget_refusals: RefusalLog::default(),
     });
-    let base = spawn(router(state)).await;
+    let base = spawn(router(state.clone())).await;
     Harness {
+        app: state,
         base,
         store,
         memory,
@@ -2712,7 +2714,10 @@ async fn repeated_status_polls_of_a_confirmed_purchase_share_one_processor_pull(
         .session_reads
         .load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..5 {
-        harness.status(BUNDLE).await;
+        assert_eq!(
+            harness.status(BUNDLE).await,
+            json!({"status": "confirmed", "confirmations": 1, "amount_matched": true})
+        );
     }
     let reads = harness
         .stripe_mock
@@ -2844,17 +2849,16 @@ async fn status_poll_with_an_empty_pull_budget_does_not_advance_a_created_purcha
 
 #[tokio::test]
 async fn a_refund_seen_after_the_freshness_window_flips_the_status() {
-    let harness = build_harness(HarnessOptions {
-        status_pull_freshness: Duration::from_secs(1),
-        ..HarnessOptions::default()
-    })
-    .await;
+    let harness = harness().await;
     confirm_stripe_purchase(&harness).await;
     assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
 
     harness.stripe_mock.refund("cs_test_1", 1999);
     assert_eq!(harness.status(BUNDLE).await["status"], "confirmed");
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    harness
+        .app
+        .status_pull_cache
+        .age_entries(harness.app.status_pull_freshness);
     assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
     assert_eq!(harness.state(BUNDLE).await, CorrelationState::Reversed);
 }
@@ -3065,4 +3069,32 @@ async fn open_unpaid_sessions_cannot_starve_promotion_of_a_paid_purchase() {
         json!({"status": "confirmed", "confirmations": 1, "amount_matched": true})
     );
     assert_eq!(harness.state(BUNDLE).await, CorrelationState::Confirmed);
+}
+
+#[tokio::test]
+async fn promotion_with_an_empty_pull_budget_holds_a_paid_purchase_at_detected() {
+    let harness = build_harness(HarnessOptions {
+        status_pull_bucket: (0, 0),
+        settlement_pull_bucket: (0, 0),
+        ..HarnessOptions::default()
+    })
+    .await;
+    paid_past_settlement_delay(&harness, BUNDLE).await;
+
+    let before = harness
+        .stripe_mock
+        .session_reads
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        json!({"status": "detected", "confirmations": 0, "amount_matched": true})
+    );
+    assert_eq!(
+        harness
+            .stripe_mock
+            .session_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
 }

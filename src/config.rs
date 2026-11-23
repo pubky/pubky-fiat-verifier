@@ -283,14 +283,26 @@ impl Config {
             )?),
             checkout_rate_per_second: parse_u64("FIAT_CHECKOUT_RATE_PER_SECOND", 5)?,
             checkout_rate_burst: parse_u64("FIAT_CHECKOUT_RATE_BURST", 20)?,
-            status_pull_freshness: Duration::from_secs(parse_u64(
+            status_pull_freshness: status_pull_freshness(parse_u64(
                 "FIAT_STATUS_PULL_FRESHNESS_SECONDS",
                 15,
-            )?),
-            status_pull_rate_per_second: parse_u64("FIAT_STATUS_PULL_RATE_PER_SECOND", 10)?,
-            status_pull_rate_burst: parse_u64("FIAT_STATUS_PULL_RATE_BURST", 50)?,
-            settlement_pull_rate_per_second: parse_u64("FIAT_SETTLEMENT_PULL_RATE_PER_SECOND", 5)?,
-            settlement_pull_rate_burst: parse_u64("FIAT_SETTLEMENT_PULL_RATE_BURST", 20)?,
+            )?)?,
+            status_pull_rate_per_second: positive(
+                "FIAT_STATUS_PULL_RATE_PER_SECOND",
+                parse_u64("FIAT_STATUS_PULL_RATE_PER_SECOND", 10)?,
+            )?,
+            status_pull_rate_burst: positive(
+                "FIAT_STATUS_PULL_RATE_BURST",
+                parse_u64("FIAT_STATUS_PULL_RATE_BURST", 50)?,
+            )?,
+            settlement_pull_rate_per_second: positive(
+                "FIAT_SETTLEMENT_PULL_RATE_PER_SECOND",
+                parse_u64("FIAT_SETTLEMENT_PULL_RATE_PER_SECOND", 5)?,
+            )?,
+            settlement_pull_rate_burst: positive(
+                "FIAT_SETTLEMENT_PULL_RATE_BURST",
+                parse_u64("FIAT_SETTLEMENT_PULL_RATE_BURST", 20)?,
+            )?,
         })
     }
 }
@@ -358,6 +370,29 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
         .ok_or(ConfigError::Missing(name))
 }
 
+/// Longest time a status request may reuse a processor observation: it
+/// bounds how stale the observation behind a `confirmed` answer can be.
+pub const MAX_STATUS_PULL_FRESHNESS_SECONDS: u64 = 60;
+
+fn status_pull_freshness(seconds: u64) -> Result<Duration, ConfigError> {
+    if seconds > MAX_STATUS_PULL_FRESHNESS_SECONDS {
+        return Err(ConfigError::Invalid(
+            "FIAT_STATUS_PULL_FRESHNESS_SECONDS",
+            format!("must be at most {MAX_STATUS_PULL_FRESHNESS_SECONDS}"),
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// A zero pull rate or burst would silently stop status pulls, and with them
+/// every `confirmed` answer.
+fn positive(name: &'static str, value: u64) -> Result<u64, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(name, "must be positive".to_owned()));
+    }
+    Ok(value)
+}
+
 fn parse_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     match std::env::var(name) {
         Ok(value) => value
@@ -409,6 +444,23 @@ mod tests {
                 "entry should be rejected: {entry}"
             );
         }
+    }
+
+    #[test]
+    fn status_pull_freshness_is_capped() {
+        assert_eq!(status_pull_freshness(0).unwrap(), Duration::ZERO);
+        assert_eq!(status_pull_freshness(15).unwrap(), Duration::from_secs(15));
+        assert_eq!(
+            status_pull_freshness(MAX_STATUS_PULL_FRESHNESS_SECONDS).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert!(status_pull_freshness(61).is_err());
+    }
+
+    #[test]
+    fn zero_pull_budgets_are_rejected() {
+        assert!(positive("FIAT_STATUS_PULL_RATE_BURST", 0).is_err());
+        assert_eq!(positive("FIAT_STATUS_PULL_RATE_BURST", 1).unwrap(), 1);
     }
 
     #[test]
