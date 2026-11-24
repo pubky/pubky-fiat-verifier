@@ -33,7 +33,7 @@ use crate::proxy::PaykitProxy;
 use crate::rate_limit::TokenBucket;
 use crate::state::{report, Report};
 use crate::store::{
-    Correlation, CorrelationState, CorrelationStore, InsertOutcome, NewCorrelation,
+    Correlation, CorrelationState, CorrelationStore, InsertOutcome, NewCorrelation, StoreError,
 };
 use crate::stripe::{client_reference, idempotency_key, StripeProcessor};
 use crate::verification::{
@@ -50,7 +50,9 @@ const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
 /// A checkout session this close to expiry is replaced rather than returned.
 const SESSION_EXPIRY_SLACK_SECONDS: i64 = 60;
 /// PayPal's create-order response carries no expiry; orders are approvable
-/// for roughly three hours, so the recorded expiry mirrors that default.
+/// for roughly three hours, so the recorded expiry mirrors that default,
+/// counted from the order's `create_time`, which a `PayPal-Request-Id`
+/// replay keeps.
 const PAYPAL_ORDER_TTL_SECONDS: i64 = 3 * 3600;
 const MAX_STATUS_PULL_CACHE_ENTRIES: usize = 10_000;
 
@@ -128,6 +130,11 @@ impl StatusPullCache {
 pub struct AppState {
     pub trusted_key: VerifyingKey,
     pub store: Arc<dyn CorrelationStore>,
+    /// The store /checkout-sessions uses. In production it is its own pool
+    /// of `FIAT_CHECKOUT_LOOKUP_CONCURRENCY` connections, so checkout never
+    /// holds a connection that status polls, webhooks, invoices or the
+    /// worker need, not even one SQLx is still returning.
+    pub checkout_store: Arc<dyn CorrelationStore>,
     pub processors: Arc<Processors>,
     /// Effective default for unbound checkout requests naming no processor:
     /// the sole configured processor, or `FIAT_DEFAULT_PROCESSOR` when both
@@ -145,8 +152,8 @@ pub struct AppState {
     /// Exact `https://` origins a checkout request may name as
     /// `return_origin` (canonical `url::Url` serializations).
     pub buyer_return_origins: Vec<String>,
-    /// Bounds the store calls /checkout-sessions runs at once, so checkout
-    /// cannot take the pool connections status and webhook work needs.
+    /// Bounds how long /checkout-sessions waits to run a store call on
+    /// `checkout_store`; that store's own pool bounds its connections.
     pub checkout_db_gate: CheckoutDbGate,
     /// Charged only when a checkout request mints a new session.
     pub checkout_limiter: TokenBucket,
@@ -165,7 +172,10 @@ pub struct AppState {
 /// Admission for the store calls of /checkout-sessions: each call holds one
 /// permit only while it runs, and never across a processor call. Waiters are
 /// served in arrival order. Permits are released on drop, so a request whose
-/// handler stops early never leaks one.
+/// handler stops early never leaks one. A permit is released when the store
+/// future returns, before SQLx has returned its connection, so the gate
+/// bounds waiting, not connections: those are bounded by the checkout
+/// store's pool, whose acquire timeout adds at most one more wait.
 pub struct CheckoutDbGate {
     permits: Arc<tokio::sync::Semaphore>,
     wait: Duration,
@@ -180,11 +190,12 @@ impl CheckoutDbGate {
     }
 
     /// Runs `call` under a permit. When none frees up within the wait,
-    /// `call` is never started and the request gets `ApiError::Busy`.
+    /// `call` is never started and the request gets `ApiError::Busy`; so
+    /// does a call whose store found no free pooled connection in time.
     #[allow(clippy::result_large_err)]
-    async fn run<F, T>(&self, call: impl FnOnce() -> F) -> Result<T, Response>
+    async fn run<F, T>(&self, call: impl FnOnce() -> F) -> Result<Result<T, StoreError>, Response>
     where
-        F: std::future::Future<Output = T>,
+        F: std::future::Future<Output = Result<T, StoreError>>,
     {
         let permit = match tokio::time::timeout(self.wait, self.permits.acquire()).await {
             Ok(Ok(permit)) => permit,
@@ -192,7 +203,10 @@ impl CheckoutDbGate {
         };
         let output = call().await;
         drop(permit);
-        Ok(output)
+        match output {
+            Err(StoreError::Busy) => Err(ApiError::Busy.into_response()),
+            output => Ok(output),
+        }
     }
 
     #[cfg(test)]
@@ -206,19 +220,34 @@ impl CheckoutDbGate {
     }
 }
 
-/// Runs a store call of the session mint: under the checkout gate when the
-/// checkout route minted, directly for the eager mint on /invoices.
+/// Which route a session mint serves, and so which store and admission its
+/// store calls use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MintRoute {
+    /// /checkout-sessions: `checkout_store`, under `checkout_db_gate`.
+    Checkout,
+    /// The eager mint on /invoices: the main store, ungated.
+    Invoice,
+}
+
+/// Runs a store call of the session mint on the store its route uses.
 #[allow(clippy::result_large_err)]
-async fn mint_store_call<F, T>(
-    gate: Option<&CheckoutDbGate>,
-    call: impl FnOnce() -> F,
-) -> Result<T, Response>
+async fn mint_store_call<'a, F, T>(
+    state: &'a AppState,
+    route: MintRoute,
+    call: impl FnOnce(&'a dyn CorrelationStore) -> F,
+) -> Result<Result<T, StoreError>, Response>
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = Result<T, StoreError>>,
 {
-    match gate {
-        Some(gate) => gate.run(call).await,
-        None => Ok(call().await),
+    match route {
+        MintRoute::Checkout => {
+            state
+                .checkout_db_gate
+                .run(|| call(state.checkout_store.as_ref()))
+                .await
+        }
+        MintRoute::Invoice => Ok(call(state.store.as_ref()).await),
     }
 }
 
@@ -444,7 +473,7 @@ async fn create_invoice(
             // existed: idempotently create it now.
             match mint_session(
                 &state,
-                None,
+                MintRoute::Invoice,
                 kind,
                 creator,
                 &request.bundle_id,
@@ -472,7 +501,7 @@ async fn create_invoice(
             };
             match mint_session(
                 &state,
-                None,
+                MintRoute::Invoice,
                 kind,
                 creator,
                 &request.bundle_id,
@@ -516,56 +545,162 @@ fn return_urls(state: &AppState, return_origin: Option<&str>) -> (String, String
     }
 }
 
-/// Creates a processor session and persists it. `gate` is the checkout
-/// route's admission gate (`None` for the eager mint on /invoices); it covers
-/// only the store calls, never the processor call. When a store call cannot
+/// A session or order the processor returned for one mint attempt.
+struct MintedSession {
+    kind: ProcessorKind,
+    session_id: String,
+    checkout_url: String,
+    expires_at: i64,
+}
+
+/// Creates a processor session and persists it. Store calls go where
+/// `route` says, never across the processor call. When a store call cannot
 /// be admitted after the processor session exists, the row keeps its
-/// previous `session_attempt`, so a retry reuses the same idempotency key
-/// and gets the same processor session back.
+/// previous `session_attempt`, so a retry with the same redirect URLs
+/// reuses the same idempotency key and gets the same processor session
+/// back. A replay of such an attempt that is already expired was never
+/// served: it is skipped (the skip is persisted) and the next attempt is
+/// minted once. A second expired session answers 503 busy.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn mint_session(
     state: &Arc<AppState>,
-    gate: Option<&CheckoutDbGate>,
+    route: MintRoute,
     kind: ProcessorKind,
     creator: &str,
     bundle_id: &str,
     asset: &str,
     amount_minor: i64,
-    attempt: i32,
+    first_attempt: i32,
     return_origin: Option<&str>,
 ) -> Result<CheckoutSessionResponse, Response> {
+    let (success_url, cancel_url) = return_urls(state, return_origin);
+    let mut attempt = first_attempt;
+    let minted = loop {
+        let minted = create_processor_session(
+            state,
+            kind,
+            creator,
+            bundle_id,
+            asset,
+            amount_minor,
+            &idempotency_key(creator, bundle_id, attempt, &success_url, &cancel_url),
+            &success_url,
+            &cancel_url,
+        )
+        .await?;
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        if minted.expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
+            break minted;
+        }
+        tracing::warn!(
+            processor = kind.as_str(),
+            creator,
+            bundle_id,
+            attempt,
+            session_id = %minted.session_id,
+            expires_at = minted.expires_at,
+            "processor replayed an expired, never-served session; skipping its attempt"
+        );
+        if attempt != first_attempt {
+            return Err(ApiError::Busy.into_response());
+        }
+        mint_store_call(state, route, |store| {
+            store.skip_session_attempt(creator, bundle_id, attempt)
+        })
+        .await?
+        .map_err(|error| {
+            tracing::error!(%error, "failed to record the skipped session attempt");
+            ApiError::Unavailable.into_response()
+        })?;
+        attempt += 1;
+    };
+    let persisted = mint_store_call(state, route, |store| {
+        store.set_session(
+            creator,
+            bundle_id,
+            minted.kind.as_str(),
+            &minted.session_id,
+            &minted.checkout_url,
+            minted.expires_at,
+            attempt,
+            return_origin,
+        )
+    })
+    .await?
+    .map_err(|error| {
+        tracing::error!(%error, processor = minted.kind.as_str(), "failed to persist checkout session");
+        ApiError::Unavailable.into_response()
+    })?;
+    if !persisted {
+        return persisted_session_after_lost_race(state, route, creator, bundle_id).await;
+    }
+    Ok(CheckoutSessionResponse {
+        checkout_url: minted.checkout_url,
+        processor: minted.kind.as_str(),
+        expires_at: minted.expires_at,
+    })
+}
+
+/// One create call. A reused idempotency key (Stripe) or request id
+/// (PayPal) returns the session or order of that earlier call, with its
+/// original expiry.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+async fn create_processor_session(
+    state: &AppState,
+    kind: ProcessorKind,
+    creator: &str,
+    bundle_id: &str,
+    asset: &str,
+    amount_minor: i64,
+    idempotency_key: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<MintedSession, Response> {
     match kind {
         ProcessorKind::Stripe => {
             let Some(stripe) = state.processors.stripe.as_ref() else {
                 return Err(ApiError::Unavailable.into_response());
             };
-            mint_stripe_session(
-                state,
-                gate,
-                stripe,
-                creator,
-                bundle_id,
-                asset,
-                amount_minor,
-                attempt,
-                return_origin,
-            )
-            .await
+            let session = stripe
+                .create_checkout_session(
+                    &client_reference(creator, bundle_id),
+                    idempotency_key,
+                    amount_minor,
+                    &asset.to_ascii_lowercase(),
+                    "Marketplace listing (Locks entitlement)",
+                    success_url,
+                    cancel_url,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, creator, bundle_id, "stripe checkout session creation failed");
+                    ApiError::Unavailable.into_response()
+                })?;
+            let (Some(checkout_url), Some(expires_at)) = (session.url.clone(), session.expires_at)
+            else {
+                tracing::error!(session_id = %session.id, "created checkout session has no url or expiry");
+                return Err(ApiError::Unavailable.into_response());
+            };
+            Ok(MintedSession {
+                kind,
+                session_id: session.id,
+                checkout_url,
+                expires_at,
+            })
         }
         ProcessorKind::Paypal => {
             let Some(paypal) = state.processors.paypal.as_ref() else {
                 return Err(ApiError::Unavailable.into_response());
             };
-            let (success_url, cancel_url) = return_urls(state, return_origin);
             let order = paypal
                 .create_order(
                     &client_reference(creator, bundle_id),
-                    &idempotency_key(creator, bundle_id, attempt),
+                    idempotency_key,
                     amount_minor,
                     asset,
                     "Marketplace listing (Locks entitlement)",
-                    &success_url,
-                    &cancel_url,
+                    success_url,
+                    cancel_url,
                 )
                 .await
                 .map_err(|error| {
@@ -576,94 +711,21 @@ async fn mint_session(
                 tracing::error!(order_id = %order.id, "created paypal order has no approval link");
                 ApiError::Unavailable.into_response()
             })?;
-            let expires_at = OffsetDateTime::now_utc().unix_timestamp() + PAYPAL_ORDER_TTL_SECONDS;
-            let persisted = mint_store_call(gate, || {
-                state.store.set_session(
-                    creator,
-                    bundle_id,
-                    ProcessorKind::Paypal.as_str(),
-                    &order.id,
-                    &approval_url,
-                    expires_at,
-                    attempt,
-                    return_origin,
-                )
-            })
-            .await?
-            .map_err(|error| {
-                tracing::error!(%error, "failed to persist paypal order");
+            // Without its creation time the order's expiry is unknown, and a
+            // replayed order would be advertised past its window.
+            let created_at = order.created_at_unix().ok_or_else(|| {
+                tracing::error!(order_id = %order.id, "created paypal order has no readable create_time");
                 ApiError::Unavailable.into_response()
             })?;
-            if !persisted {
-                return persisted_session_after_lost_race(state, gate, creator, bundle_id).await;
-            }
-            Ok(CheckoutSessionResponse {
+            let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+            Ok(MintedSession {
+                kind,
+                session_id: order.id,
                 checkout_url: approval_url,
-                processor: ProcessorKind::Paypal.as_str(),
-                expires_at,
+                expires_at: created_at.min(now_unix) + PAYPAL_ORDER_TTL_SECONDS,
             })
         }
     }
-}
-
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
-async fn mint_stripe_session(
-    state: &Arc<AppState>,
-    gate: Option<&CheckoutDbGate>,
-    stripe: &Arc<StripeProcessor>,
-    creator: &str,
-    bundle_id: &str,
-    asset: &str,
-    amount_minor: i64,
-    attempt: i32,
-    return_origin: Option<&str>,
-) -> Result<CheckoutSessionResponse, Response> {
-    let (success_url, cancel_url) = return_urls(state, return_origin);
-    let session = stripe
-        .create_checkout_session(
-            &client_reference(creator, bundle_id),
-            &idempotency_key(creator, bundle_id, attempt),
-            amount_minor,
-            &asset.to_ascii_lowercase(),
-            "Marketplace listing (Locks entitlement)",
-            &success_url,
-            &cancel_url,
-        )
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, creator, bundle_id, "stripe checkout session creation failed");
-            ApiError::Unavailable.into_response()
-        })?;
-    let checkout_url = session.url.clone().ok_or_else(|| {
-        tracing::error!(session_id = %session.id, "created checkout session has no url");
-        ApiError::Unavailable.into_response()
-    })?;
-    let expires_at = session.expires_at.unwrap_or(0);
-    let persisted = mint_store_call(gate, || {
-        state.store.set_session(
-            creator,
-            bundle_id,
-            ProcessorKind::Stripe.as_str(),
-            &session.id,
-            &checkout_url,
-            expires_at,
-            attempt,
-            return_origin,
-        )
-    })
-    .await?
-    .map_err(|error| {
-        tracing::error!(%error, "failed to persist checkout session");
-        ApiError::Unavailable.into_response()
-    })?;
-    if !persisted {
-        return persisted_session_after_lost_race(state, gate, creator, bundle_id).await;
-    }
-    Ok(CheckoutSessionResponse {
-        checkout_url,
-        processor: ProcessorKind::Stripe.as_str(),
-        expires_at,
-    })
 }
 
 /// The conditional persist of a just-minted session lost the race: between
@@ -677,18 +739,19 @@ async fn mint_stripe_session(
 #[allow(clippy::result_large_err)]
 async fn persisted_session_after_lost_race(
     state: &Arc<AppState>,
-    gate: Option<&CheckoutDbGate>,
+    route: MintRoute,
     creator: &str,
     bundle_id: &str,
 ) -> Result<CheckoutSessionResponse, Response> {
-    let correlation = match mint_store_call(gate, || state.store.get(creator, bundle_id)).await? {
-        Ok(Some(correlation)) => correlation,
-        Ok(None) => return Err(ApiError::InvoiceConflict.into_response()),
-        Err(error) => {
-            tracing::error!(%error, "correlation re-read failed");
-            return Err(ApiError::Unavailable.into_response());
-        }
-    };
+    let correlation =
+        match mint_store_call(state, route, |store| store.get(creator, bundle_id)).await? {
+            Ok(Some(correlation)) => correlation,
+            Ok(None) => return Err(ApiError::InvoiceConflict.into_response()),
+            Err(error) => {
+                tracing::error!(%error, "correlation re-read failed");
+                return Err(ApiError::Unavailable.into_response());
+            }
+        };
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     if correlation.state == CorrelationState::Created {
         if let (Some(bound), Some(url), Some(expires_at)) = (
@@ -917,9 +980,13 @@ async fn checkout_session(
     if !state.processors.any_configured() {
         return ApiError::Unavailable.into_response();
     }
-    let gate = &state.checkout_db_gate;
-    let lookup = match gate
-        .run(|| state.store.get(&request.creator, &request.bundle_id))
+    let lookup = match state
+        .checkout_db_gate
+        .run(|| {
+            state
+                .checkout_store
+                .get(&request.creator, &request.bundle_id)
+        })
         .await
     {
         Ok(lookup) => lookup,
@@ -990,7 +1057,7 @@ async fn checkout_session(
     }
     match mint_session(
         &state,
-        Some(gate),
+        MintRoute::Checkout,
         kind,
         &request.creator,
         &request.bundle_id,

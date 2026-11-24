@@ -149,6 +149,11 @@ impl MockStripe {
         })
     }
 
+    fn set_expires_at(&self, session_id: &str, expires_at: i64) {
+        self.sessions.lock().unwrap().get_mut(session_id).unwrap()["expires_at"] =
+            json!(expires_at);
+    }
+
     fn fail_payment_intent_reads(&self, fail: bool) {
         *self.payment_intents_unavailable.lock().unwrap() = fail;
     }
@@ -158,7 +163,7 @@ async fn mock_create_session(
     State(mock): State<MockStripe>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     mock.create_calls
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let gate = mock.create_gate.lock().unwrap().take();
@@ -173,12 +178,23 @@ async fn mock_create_session(
     let form = String::from_utf8(body.to_vec()).unwrap();
     {
         let creates = mock.creates.lock().unwrap();
-        // Stripe idempotency: same key returns the same session.
-        for (index, (key, _)) in creates.iter().enumerate() {
+        // Stripe idempotency: same key returns the same session, and a
+        // reused key with different parameters is refused.
+        for (index, (key, first_form)) in creates.iter().enumerate() {
             if *key == idempotency {
+                if *first_form != form {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"error": {
+                            "type": "idempotency_error",
+                            "message": "Keys for idempotent requests can only be used with the same parameters they were first used with.",
+                        }})),
+                    )
+                        .into_response();
+                }
                 let id = format!("cs_test_{}", index + 1);
                 let session = mock.sessions.lock().unwrap().get(&id).cloned().unwrap();
-                return Json(session);
+                return Json(session).into_response();
             }
         }
     }
@@ -207,7 +223,7 @@ async fn mock_create_session(
         .unwrap()
         .insert(id.clone(), session.clone());
     mock.creates.lock().unwrap().push((idempotency, form));
-    Json(session)
+    Json(session).into_response()
 }
 
 async fn mock_get_session(
@@ -320,9 +336,39 @@ struct MockPaypal {
     /// One-shot gate: when armed, the next create-order call blocks until
     /// the test releases it (deterministic race windows, no sleeps).
     create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    /// When set, the next order created carries no `create_time`.
+    omit_next_create_time: Arc<Mutex<bool>>,
+    /// When set, `create_gate` waits for the next call that creates an
+    /// order and lets request-id replays through.
+    create_gate_skips_replays: Arc<Mutex<bool>>,
 }
 
 impl MockPaypal {
+    /// Moves an order's `create_time` `by` into the past.
+    fn backdate(&self, order_id: &str, by: Duration) {
+        let mut orders = self.orders.lock().unwrap();
+        let order = orders.get_mut(order_id).unwrap();
+        let created = OffsetDateTime::parse(
+            order["create_time"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        order["create_time"] = json!((created - by)
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap());
+    }
+
+    fn created_at(&self, order_id: &str) -> i64 {
+        OffsetDateTime::parse(
+            self.orders.lock().unwrap()[order_id]["create_time"]
+                .as_str()
+                .unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+        .unix_timestamp()
+    }
+
     fn approve(&self, order_id: &str) {
         let mut orders = self.orders.lock().unwrap();
         orders.get_mut(order_id).unwrap()["status"] = json!("APPROVED");
@@ -398,15 +444,23 @@ async fn mock_paypal_create_order(
 ) -> impl IntoResponse {
     mock.create_calls
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let gate = mock.create_gate.lock().unwrap().take();
-    if let Some(gate) = gate {
-        let _ = gate.await;
-    }
     let request_id = headers
         .get("paypal-request-id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let replay = mock
+        .creates
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| *key == request_id);
+    if !(replay && *mock.create_gate_skips_replays.lock().unwrap()) {
+        let gate = mock.create_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+    }
     let body_text = String::from_utf8(body.to_vec()).unwrap();
     {
         let creates = mock.creates.lock().unwrap();
@@ -428,6 +482,9 @@ async fn mock_paypal_create_order(
         "status": "CREATED",
         "intent": parsed["intent"],
         "processing_instruction": parsed["processing_instruction"],
+        "create_time": OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
         "purchase_units": [{
             "custom_id": parsed["purchase_units"][0]["custom_id"],
             "amount": parsed["purchase_units"][0]["amount"],
@@ -439,6 +496,10 @@ async fn mock_paypal_create_order(
              "href": format!("https://sandbox.paypal.test/checkoutnow?token={id}")}
         ]
     });
+    let mut order = order;
+    if std::mem::take(&mut *mock.omit_next_create_time.lock().unwrap()) {
+        order.as_object_mut().unwrap().remove("create_time");
+    }
     mock.orders
         .lock()
         .unwrap()
@@ -700,14 +761,22 @@ async fn spawn(app: Router) -> String {
 }
 
 async fn build_harness(options: HarnessOptions) -> Harness {
-    build_harness_with_store(options, None).await
+    build_harness_with_stores(options, None).await
 }
 
-/// `store` replaces the in-memory store the router and worker use; the
-/// `memory` handle then stays empty.
+/// `store` replaces the in-memory store the router and worker use, and also
+/// serves /checkout-sessions; the `memory` handle then stays empty.
 async fn build_harness_with_store(
     options: HarnessOptions,
-    store: Option<Arc<dyn CorrelationStore>>,
+    store: Arc<dyn CorrelationStore>,
+) -> Harness {
+    build_harness_with_stores(options, Some((store.clone(), store))).await
+}
+
+/// `stores` is (main store, checkout store), replacing the in-memory store.
+async fn build_harness_with_stores(
+    options: HarnessOptions,
+    stores: Option<(Arc<dyn CorrelationStore>, Arc<dyn CorrelationStore>)>,
 ) -> Harness {
     let stripe_mock = MockStripe::default();
     let stripe_url = spawn(
@@ -787,7 +856,8 @@ async fn build_harness_with_store(
     );
 
     let memory = Arc::new(MemoryStore::default());
-    let store: Arc<dyn CorrelationStore> = store.unwrap_or_else(|| memory.clone());
+    let (store, checkout_store): (Arc<dyn CorrelationStore>, Arc<dyn CorrelationStore>) =
+        stores.unwrap_or_else(|| (memory.clone(), memory.clone()));
     let processors = Arc::new(Processors {
         stripe: options.with_stripe.then(|| {
             Arc::new(StripeProcessor::new(
@@ -813,6 +883,7 @@ async fn build_harness_with_store(
     let state = Arc::new(AppState {
         trusted_key: locks_key().verifying_key(),
         store: store.clone(),
+        checkout_store,
         processors: processors.clone(),
         default_processor,
         criterion_source: Arc::new(StaticCriteria(Mutex::new(criteria))),
@@ -1106,7 +1177,7 @@ async fn usd_invoice_creates_idempotent_checkout_session() {
     assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
 
     let (idempotency_key, form) = harness.stripe_mock.creates.lock().unwrap()[0].clone();
-    assert!(idempotency_key.starts_with("fiatv1-"));
+    assert!(idempotency_key.starts_with("fiatv2-"));
     assert!(form.contains("mode=payment"));
     assert!(form.contains("unit_amount%5D=1999"));
     assert!(form.contains("currency%5D=usd"));
@@ -1421,7 +1492,7 @@ async fn paypal_only_invoice_mints_order_eagerly_and_idempotently() {
     assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 1);
 
     let (request_id, body) = harness.paypal_mock.creates.lock().unwrap()[0].clone();
-    assert!(request_id.starts_with("fiatv1-"));
+    assert!(request_id.starts_with("fiatv2-"));
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["intent"], "CAPTURE");
     assert_eq!(
@@ -3263,6 +3334,16 @@ impl CorrelationStore for ReversalBeforeConfirm {
             )
             .await
     }
+    async fn skip_session_attempt(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_attempt: i32,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .skip_session_attempt(creator, bundle_id, session_attempt)
+            .await
+    }
     async fn mark_paid(
         &self,
         creator: &str,
@@ -3360,7 +3441,7 @@ async fn reversal_between_promotion_pull_and_update_is_never_confirmed(
     bundle: &str,
 ) {
     let store: Arc<dyn CorrelationStore> = Arc::new(ReversalBeforeConfirm { inner });
-    let harness = build_harness_with_store(HarnessOptions::default(), Some(store)).await;
+    let harness = build_harness_with_store(HarnessOptions::default(), store).await;
     paid_past_settlement_delay(&harness, bundle).await;
 
     assert_eq!(
@@ -3598,7 +3679,7 @@ impl CorrelationStore for HoldingReads {
         if !bundle_id.starts_with("HOLD") {
             return self.inner.get(creator, bundle_id).await;
         }
-        let store_error = |error: sqlx::Error| StoreError(error.to_string());
+        let store_error = |error: sqlx::Error| StoreError::Failed(error.to_string());
         let mut connection = self.inner.pool().acquire().await.map_err(store_error)?;
         let now_held = self.held.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now_held, Ordering::SeqCst);
@@ -3636,6 +3717,16 @@ impl CorrelationStore for HoldingReads {
                 session_attempt,
                 return_origin,
             )
+            .await
+    }
+    async fn skip_session_attempt(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_attempt: i32,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .skip_session_attempt(creator, bundle_id, session_attempt)
             .await
     }
     async fn mark_paid(
@@ -3716,27 +3807,27 @@ impl CorrelationStore for HoldingReads {
 #[tokio::test]
 async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
     use std::sync::atomic::Ordering;
-    let Some(store) = crate::store::postgres_tests::store().await else {
+    let Some(stores) = crate::store::postgres_tests::stores().await else {
         return;
     };
-    let concurrency = 4;
+    let concurrency = crate::store::postgres_tests::TEST_CHECKOUT_POOL.connections as usize;
     let (release, release_rx) = tokio::sync::watch::channel(false);
     let holding = Arc::new(HoldingReads {
-        inner: Arc::new(store),
+        inner: Arc::new(stores.checkout),
         held: std::sync::atomic::AtomicUsize::new(0),
         peak: std::sync::atomic::AtomicUsize::new(0),
         release: release_rx,
     });
     assert_eq!(
-        holding.inner.pool().options().get_max_connections(),
-        crate::store::STORE_POOL_SIZE
+        holding.inner.pool().options().get_max_connections() as usize,
+        concurrency
     );
-    let harness = build_harness_with_store(
+    let harness = build_harness_with_stores(
         HarnessOptions {
             checkout_db_gate: (concurrency, Duration::from_secs(10)),
             ..HarnessOptions::default()
         },
-        Some(holding.clone()),
+        Some((Arc::new(stores.main), holding.clone())),
     )
     .await;
     let run = OffsetDateTime::now_utc().unix_timestamp_nanos();
@@ -3774,4 +3865,413 @@ async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
         assert_eq!(status.unwrap(), 404);
     }
     assert_eq!(holding.peak.load(Ordering::SeqCst), concurrency);
+}
+
+#[tokio::test]
+async fn checkout_connections_still_returning_never_take_status_or_webhook_connections() {
+    let Some(stores) = crate::store::postgres_tests::stores().await else {
+        return;
+    };
+    let checkout_connections = crate::store::postgres_tests::TEST_CHECKOUT_POOL.connections;
+    let checkout_pool = stores.checkout.pool().clone();
+    let main_pool = stores.main.pool().clone();
+    let harness = build_harness_with_stores(
+        HarnessOptions {
+            checkout_db_gate: (checkout_connections as usize, Duration::from_secs(2)),
+            ..HarnessOptions::default()
+        },
+        Some((Arc::new(stores.main), Arc::new(stores.checkout))),
+    )
+    .await;
+    let run = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let bundle = format!("RETURNING{run}");
+    assert_eq!(harness.invoice("usd", &bundle).await.status().as_u16(), 204);
+
+    // To its pool, a connection SQLx is still returning (ping before
+    // release) is a checked-out connection. Take every one checkout's pool
+    // will hand out, as if all of them were mid-return at once.
+    let mut returning = Vec::new();
+    for _ in 0..crate::store::STORE_POOL_SIZE {
+        match tokio::time::timeout(Duration::from_millis(100), checkout_pool.acquire()).await {
+            Ok(Ok(connection)) => returning.push(connection),
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(3), harness.status(&bundle))
+        .await
+        .expect("a status poll must still get a connection");
+    assert_eq!(status["status"], "undetected");
+    let other = format!("RETURNINGOTHER{run}");
+    let invoice = tokio::time::timeout(Duration::from_secs(3), harness.invoice("usd", &other))
+        .await
+        .expect("an invoice write must still get a connection");
+    assert_eq!(invoice.status().as_u16(), 204);
+    let event = json!({
+        "id": format!("evt_returning_{run}"),
+        "type": "checkout.session.completed",
+        "data": {"object": {"id": "cs_test_1",
+            "client_reference_id": format!("{CREATOR}_{bundle}")}}
+    });
+    let webhook = tokio::time::timeout(Duration::from_secs(3), harness.send_webhook(&event))
+        .await
+        .expect("a webhook must still get a connection");
+    assert_eq!(webhook.status().as_u16(), 200);
+    assert_eq!(returning.len(), checkout_connections as usize);
+
+    let busy = harness.checkout(&format!("RETURNINGNONE{run}"), None).await;
+    assert_eq!(busy.status().as_u16(), 503);
+    assert_eq!(
+        busy.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(
+        harness.app.checkout_db_gate.available_permits(),
+        checkout_connections as usize,
+        "the checkout pool, not the gate, refused the call"
+    );
+
+    drop(returning);
+    let after_release = harness.checkout(&format!("RETURNINGNONE{run}"), None).await;
+    assert_eq!(after_release.status().as_u16(), 404);
+    assert!(checkout_pool.size() <= checkout_connections);
+    assert!(main_pool.size() <= crate::store::STORE_POOL_SIZE - checkout_connections);
+}
+
+/// Starts a checkout whose processor call completes while every gate
+/// permit is held, so the persist gets 503 busy after the processor
+/// session exists. The row keeps `session_attempt` 0 and no session.
+async fn checkout_with_a_timed_out_persist(
+    harness: &Harness,
+    processor: &str,
+    return_origin: Option<&str>,
+) {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let create_calls = match processor {
+        "stripe" => {
+            *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+            harness.stripe_mock.create_calls.clone()
+        }
+        _ => {
+            *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+            harness.paypal_mock.create_calls.clone()
+        }
+    };
+    let before = create_calls.load(std::sync::atomic::Ordering::SeqCst);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let mut body = json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": processor});
+    if let Some(origin) = return_origin {
+        body["return_origin"] = json!(origin);
+    }
+    let buyer = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&create_calls, before + 1).await;
+    let held = harness
+        .app
+        .checkout_db_gate
+        .semaphore()
+        .acquire_many_owned(harness.app.checkout_db_gate.available_permits() as u32)
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let busy = buyer.await.unwrap();
+    assert_eq!(busy.status().as_u16(), 503);
+    assert_eq!(
+        busy.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    drop(held);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.return_origin, None);
+    assert_eq!(row.session_attempt, 0);
+}
+
+async fn harness_with_both_processors_and_a_short_gate() -> Harness {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_db_gate: (1, Duration::from_millis(50)),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness
+}
+
+fn expires_at(response: &Value) -> i64 {
+    response["expires_at"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn a_four_hour_old_replayed_paypal_order_is_never_served() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "paypal", None).await;
+    harness
+        .paypal_mock
+        .backdate("pporder_1", Duration::from_secs(4 * 3600));
+
+    let retry = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    assert!((expires_at(&retry) - (now + 3 * 3600)).abs() <= 5);
+    assert_eq!(
+        harness
+            .paypal_mock
+            .create_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "attempt 1 replayed, then attempt 2 created"
+    );
+    let creates = harness.paypal_mock.creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 2);
+    assert_ne!(creates[0].0, creates[1].0);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+    assert_eq!(row.session_attempt, 2);
+    assert_eq!(row.checkout_expires_at, Some(expires_at(&retry)));
+}
+
+#[tokio::test]
+async fn a_replayed_paypal_order_keeps_its_original_expiry() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "paypal", None).await;
+    harness
+        .paypal_mock
+        .backdate("pporder_1", Duration::from_secs(3600));
+
+    let retry = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_1"
+    );
+    assert_eq!(
+        expires_at(&retry),
+        harness.paypal_mock.created_at("pporder_1") + 3 * 3600
+    );
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    assert!((expires_at(&retry) - (now + 2 * 3600)).abs() <= 5);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("pporder_1"));
+    assert_eq!(row.session_attempt, 1);
+    assert_eq!(row.checkout_expires_at, Some(expires_at(&retry)));
+}
+
+#[tokio::test]
+async fn an_expired_replayed_stripe_session_is_never_served() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "stripe", None).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    harness.stripe_mock.set_expires_at("cs_test_1", now - 60);
+
+    let retry = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("cs_test_2"));
+    assert_eq!(row.session_attempt, 2);
+}
+
+#[tokio::test]
+async fn a_skipped_attempt_survives_a_second_persist_timeout() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "paypal", None).await;
+    harness
+        .paypal_mock
+        .backdate("pporder_1", Duration::from_secs(4 * 3600));
+
+    *harness
+        .paypal_mock
+        .create_gate_skips_replays
+        .lock()
+        .unwrap() = true;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let buyer = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": "paypal"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.paypal_mock.create_calls, 3).await;
+    let held = harness
+        .app
+        .checkout_db_gate
+        .semaphore()
+        .acquire_owned()
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    assert_eq!(buyer.await.unwrap().status().as_u16(), 503);
+    drop(held);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.session_attempt, 1, "the expired attempt stays skipped");
+
+    let retry = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+    assert_eq!(
+        harness
+            .paypal_mock
+            .create_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "the retry starts at attempt 2 and never replays attempt 1 again"
+    );
+    assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 2);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+    assert_eq!(row.session_attempt, 2);
+}
+
+#[tokio::test]
+async fn a_second_expired_replay_answers_busy_without_persisting() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "paypal", None).await;
+    harness
+        .paypal_mock
+        .backdate("pporder_1", Duration::from_secs(4 * 3600));
+
+    // A buyer reads attempt 0 and stalls in the processor call while a
+    // second buyer skips attempt 1 and persists attempt 2.
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let stalled = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": "paypal"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.paypal_mock.create_calls, 2).await;
+    let second = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(second.status().as_u16(), 200);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+    assert_eq!(row.session_attempt, 2);
+
+    harness
+        .paypal_mock
+        .backdate("pporder_2", Duration::from_secs(4 * 3600));
+    release.send(()).unwrap();
+    let stalled = stalled.await.unwrap();
+    assert_eq!(stalled.status().as_u16(), 503);
+    assert_eq!(
+        stalled
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let after = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(format!("{row:?}"), format!("{after:?}"));
+    assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_paypal_order_without_create_time_is_not_persisted() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    *harness.paypal_mock.omit_next_create_time.lock().unwrap() = true;
+    let response = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.processor, None);
+}
+
+#[tokio::test]
+async fn a_stripe_retry_from_another_origin_after_a_persist_timeout_mints_for_that_origin() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "stripe", Some(ORIGIN_A)).await;
+
+    let retry = harness
+        .checkout_with_origin(BUNDLE, Some("stripe"), Some(ORIGIN_B))
+        .await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+    let creates = harness.stripe_mock.creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 2);
+    assert_ne!(creates[0].0, creates[1].0);
+    let encoded_b = ORIGIN_B.replace(':', "%3A").replace('/', "%2F");
+    assert!(creates[1].1.contains(&format!(
+        "success_url={encoded_b}%2Fmarketplace%3Fcheckout%3Dreturn"
+    )));
+    assert!(creates[1].1.contains(&format!(
+        "cancel_url={encoded_b}%2Fmarketplace%3Fcheckout%3Dcancel"
+    )));
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_B));
+    assert_eq!(row.session_id.as_deref(), Some("cs_test_2"));
+
+    let first_origin = harness
+        .checkout_with_origin(BUNDLE, Some("stripe"), Some(ORIGIN_A))
+        .await;
+    assert_eq!(first_origin.status().as_u16(), 409);
+}
+
+#[tokio::test]
+async fn a_paypal_retry_from_another_origin_after_a_persist_timeout_never_replays_the_first_order()
+{
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "paypal", Some(ORIGIN_A)).await;
+
+    let retry = harness
+        .checkout_with_origin(BUNDLE, Some("paypal"), Some(ORIGIN_B))
+        .await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(
+        retry["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+    let creates = harness.paypal_mock.creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 2);
+    assert_ne!(creates[0].0, creates[1].0);
+    let body: Value = serde_json::from_str(&creates[1].1).unwrap();
+    let context = &body["payment_source"]["paypal"]["experience_context"];
+    assert_eq!(
+        context["return_url"],
+        format!("{ORIGIN_B}/marketplace?checkout=return")
+    );
+    assert_eq!(
+        context["cancel_url"],
+        format!("{ORIGIN_B}/marketplace?checkout=cancel")
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_B));
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
 }

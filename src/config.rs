@@ -92,10 +92,12 @@ pub struct Config {
     /// Max content-lock document size fetched from a homeserver.
     pub lock_resource_max_bytes: u64,
     pub lock_fetch_timeout: Duration,
-    /// Store calls /checkout-sessions may run at once; below the store pool
-    /// size, so status and webhook work always keeps a connection.
+    /// Store calls /checkout-sessions may run at once, and the size of the
+    /// checkout pool they run on; below `STORE_POOL_SIZE`, whose remainder
+    /// is the main pool that status, webhook and invoice work use.
     pub checkout_lookup_concurrency: usize,
-    /// How long a checkout store call waits for a slot before answering 503.
+    /// How long a checkout store call waits for a slot, and then for a
+    /// checkout pool connection, before answering 503.
     pub checkout_lookup_wait: Duration,
     /// Session-mint budget for the buyer-facing /checkout-sessions.
     pub checkout_rate_per_second: u64,
@@ -403,7 +405,7 @@ fn checkout_lookup_concurrency(value: u64) -> Result<usize, ConfigError> {
     if value == 0 || value >= pool {
         return Err(ConfigError::Invalid(
             "FIAT_CHECKOUT_LOOKUP_CONCURRENCY",
-            format!("must be at least 1 and below the store pool size ({pool})"),
+            format!("must be at least 1 and below the store connection budget ({pool})"),
         ));
     }
     usize::try_from(value)

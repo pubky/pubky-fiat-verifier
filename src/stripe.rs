@@ -253,16 +253,38 @@ impl StripeProcessor {
     }
 }
 
-/// Stable idempotency key for a verification task's Nth checkout session.
-pub fn idempotency_key(creator: &str, bundle_id: &str, attempt: i32) -> String {
+/// Stable idempotency key (Stripe) and request id (PayPal) for a
+/// verification task's Nth checkout session minted with these redirect
+/// URLs. The redirect URLs are the only create parameters the correlation
+/// row does not fix, and Stripe refuses a reused key whose parameters
+/// differ. A retry from another return origin therefore gets its own key:
+/// Stripe never sees changed parameters under one key, and PayPal never
+/// replays an order built for another origin.
+pub fn idempotency_key(
+    creator: &str,
+    bundle_id: &str,
+    attempt: i32,
+    success_url: &str,
+    cancel_url: &str,
+) -> String {
     use sha2::Digest;
     let mut hasher = Sha256::new();
-    hasher.update(creator.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(bundle_id.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(attempt.to_string().as_bytes());
-    format!("fiatv1-{}", hex::encode(hasher.finalize()))
+    for (index, field) in [
+        creator,
+        bundle_id,
+        &attempt.to_string(),
+        success_url,
+        cancel_url,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if index > 0 {
+            hasher.update(b"\x1f");
+        }
+        hasher.update(field.as_bytes());
+    }
+    format!("fiatv2-{}", hex::encode(hasher.finalize()))
 }
 
 /// `client_reference_id` for the session: `creator_bundleid` (both are
@@ -416,11 +438,32 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_key_is_stable_per_attempt() {
-        let a = idempotency_key("pubkyabc", "BUNDLE", 1);
-        let b = idempotency_key("pubkyabc", "BUNDLE", 1);
-        let c = idempotency_key("pubkyabc", "BUNDLE", 2);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+    fn idempotency_key_is_stable_per_attempt_and_redirect_urls() {
+        let success = "https://a.test/marketplace?checkout=return";
+        let cancel = "https://a.test/marketplace?checkout=cancel";
+        let a = idempotency_key("pubkyabc", "BUNDLE", 1, success, cancel);
+        assert!(a.starts_with("fiatv2-"));
+        assert_eq!(a, idempotency_key("pubkyabc", "BUNDLE", 1, success, cancel));
+        for other in [
+            idempotency_key("pubkyabc", "BUNDLE", 2, success, cancel),
+            idempotency_key(
+                "pubkyabc",
+                "BUNDLE",
+                1,
+                "https://b.test/marketplace?checkout=return",
+                cancel,
+            ),
+            idempotency_key(
+                "pubkyabc",
+                "BUNDLE",
+                1,
+                success,
+                "https://b.test/marketplace?checkout=cancel",
+            ),
+            idempotency_key("pubkyabd", "BUNDLE", 1, success, cancel),
+            idempotency_key("pubkyabc", "BUNDLF", 1, success, cancel),
+        ] {
+            assert_ne!(a, other);
+        }
     }
 }

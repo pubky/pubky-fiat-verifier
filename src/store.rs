@@ -7,6 +7,8 @@
 //! reversal becomes a marketplace dispute matter (design §5), but this
 //! gateway stops reporting `confirmed` for it from then on.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
@@ -93,8 +95,14 @@ pub enum ReversalOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("correlation store error: {0}")]
-pub struct StoreError(pub String);
+pub enum StoreError {
+    #[error("correlation store error: {0}")]
+    Failed(String),
+    /// No pooled connection became free within the pool's acquire timeout;
+    /// the statement never ran.
+    #[error("correlation store busy: no pooled connection within the wait")]
+    Busy,
+}
 
 #[async_trait]
 pub trait CorrelationStore: Send + Sync {
@@ -120,6 +128,15 @@ pub trait CorrelationStore: Send + Sync {
         session_attempt: i32,
         return_origin: Option<&str>,
     ) -> Result<bool, StoreError>;
+    /// Records `session_attempt` as spent without a session, so the next
+    /// mint starts after it. Forward-only and only while `created`; any
+    /// other row is left as it is.
+    async fn skip_session_attempt(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_attempt: i32,
+    ) -> Result<(), StoreError>;
     /// Records a verified-paid observation (from the API pull, never from a
     /// webhook body). Forward-only: no-op unless current state is `created`.
     async fn mark_paid(
@@ -230,22 +247,59 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 );
 "#;
 
-/// Connections in the Postgres pool. The checkout lookup concurrency is
-/// validated against this value, so checkout can never hold every connection.
+/// Postgres connections one replica opens, split between the main pool and
+/// the checkout pool. The checkout lookup concurrency is validated against
+/// this value, so the main pool always keeps at least one connection.
 pub const STORE_POOL_SIZE: u32 = 10;
 
+/// The checkout pool's share of `STORE_POOL_SIZE`.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckoutPool {
+    pub connections: u32,
+    /// How long a checkout statement waits for a connection before it fails
+    /// with `StoreError::Busy` without running.
+    pub acquire_timeout: Duration,
+}
+
+/// Two stores over one database. `/checkout-sessions` uses `checkout`;
+/// everything else uses `main`. SQLx returns a dropped connection to its
+/// pool in a spawned task that pings it first, and until then the
+/// connection still counts against that pool's `max_connections`
+/// (sqlx-core 0.8.6 `pool/connection.rs`). Separate pools therefore keep
+/// checkout off the main pool's connections whatever the return timing.
+pub struct PostgresStores {
+    pub main: PostgresStore,
+    pub checkout: PostgresStore,
+}
+
 impl PostgresStore {
-    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(STORE_POOL_SIZE)
+    pub async fn connect(
+        database_url: &str,
+        checkout: CheckoutPool,
+    ) -> Result<PostgresStores, StoreError> {
+        if checkout.connections == 0 || checkout.connections >= STORE_POOL_SIZE {
+            return Err(StoreError::Failed(format!(
+                "checkout pool needs 1 to {} of the {STORE_POOL_SIZE} connections, got {}",
+                STORE_POOL_SIZE - 1,
+                checkout.connections
+            )));
+        }
+        let main = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(STORE_POOL_SIZE - checkout.connections)
             .connect(database_url)
             .await
-            .map_err(|error| StoreError(error.to_string()))?;
-        sqlx::raw_sql(SCHEMA)
-            .execute(&pool)
+            .map_err(db_err)?;
+        sqlx::raw_sql(SCHEMA).execute(&main).await.map_err(db_err)?;
+        let checkout = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(checkout.connections)
+            .acquire_timeout(checkout.acquire_timeout)
+            .connect(database_url)
             .await
-            .map_err(|error| StoreError(error.to_string()))?;
-        Ok(Self { pool })
+            .map_err(db_err)?;
+        Ok(PostgresStores {
+            main: Self { pool: main },
+            checkout: Self { pool: checkout },
+        })
     }
 
     #[cfg(test)]
@@ -265,7 +319,7 @@ fn row_to_correlation(row: sqlx::postgres::PgRow) -> Result<Correlation, StoreEr
         asset: row.try_get("asset").map_err(db_err)?,
         amount_minor: row.try_get("amount_minor").map_err(db_err)?,
         state: CorrelationState::parse(&state)
-            .ok_or_else(|| StoreError(format!("unknown state '{state}'")))?,
+            .ok_or_else(|| StoreError::Failed(format!("unknown state '{state}'")))?,
         processor: row.try_get("processor").map_err(db_err)?,
         session_id: row.try_get("session_id").map_err(db_err)?,
         checkout_url: row.try_get("checkout_url").map_err(db_err)?,
@@ -279,7 +333,10 @@ fn row_to_correlation(row: sqlx::postgres::PgRow) -> Result<Correlation, StoreEr
 }
 
 fn db_err(error: sqlx::Error) -> StoreError {
-    StoreError(error.to_string())
+    match error {
+        sqlx::Error::PoolTimedOut => StoreError::Busy,
+        error => StoreError::Failed(error.to_string()),
+    }
 }
 
 const SELECT_COLUMNS: &str = "creator, bundle_id, lock_resource, reader, asset, amount_minor, \
@@ -308,7 +365,7 @@ impl CorrelationStore for PostgresStore {
         let existing = self
             .get(&new.creator, &new.bundle_id)
             .await?
-            .ok_or_else(|| StoreError("conflicting row vanished".to_owned()))?;
+            .ok_or_else(|| StoreError::Failed("conflicting row vanished".to_owned()))?;
         if existing.lock_resource == new.lock_resource
             && existing.reader == new.reader
             && existing.asset == new.asset
@@ -366,6 +423,26 @@ impl CorrelationStore for PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(updated.rows_affected() == 1)
+    }
+
+    async fn skip_session_attempt(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_attempt: i32,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET session_attempt = $3, updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2 AND state = 'created' \
+             AND session_attempt < $3",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(session_attempt)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn mark_paid(
@@ -741,6 +818,21 @@ pub mod memory {
             Ok(applied)
         }
 
+        async fn skip_session_attempt(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            session_attempt: i32,
+        ) -> Result<(), StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                if row.state == CorrelationState::Created && row.session_attempt < session_attempt {
+                    row.session_attempt = session_attempt;
+                }
+            }
+            Ok(())
+        }
+
         async fn mark_paid(
             &self,
             creator: &str,
@@ -960,6 +1052,47 @@ pub mod memory {
             store.get(CREATOR, bundle_id).await.unwrap().unwrap()
         }
 
+        #[tokio::test]
+        async fn a_skipped_session_attempt_only_moves_forward_on_created_rows() {
+            let store = MemoryStore::default();
+            insert(&store, "SKIP1").await;
+            store
+                .skip_session_attempt(CREATOR, "SKIP1", 2)
+                .await
+                .unwrap();
+            assert_eq!(row(&store, "SKIP1").await.session_attempt, 2);
+            store
+                .skip_session_attempt(CREATOR, "SKIP1", 1)
+                .await
+                .unwrap();
+            assert_eq!(row(&store, "SKIP1").await.session_attempt, 2);
+            assert!(mint(&store, "SKIP1", "stripe", "cs_skip", 3).await);
+            assert_eq!(row(&store, "SKIP1").await.session_attempt, 3);
+
+            insert(&store, "SKIP2").await;
+            assert!(mint(&store, "SKIP2", "stripe", "cs_paid", 1).await);
+            store
+                .mark_paid(
+                    CREATOR,
+                    "SKIP2",
+                    true,
+                    Some("pi_paid"),
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .unwrap();
+            store
+                .skip_session_attempt(CREATOR, "SKIP2", 5)
+                .await
+                .unwrap();
+            assert_eq!(row(&store, "SKIP2").await.session_attempt, 1);
+
+            store
+                .skip_session_attempt(CREATOR, "NOSUCHROW", 1)
+                .await
+                .unwrap();
+        }
+
         fn make_legacy(store: &MemoryStore, bundle_id: &str) {
             store
                 .rows
@@ -1063,15 +1196,30 @@ pub(crate) mod postgres_tests {
     /// Postgres, so the tests bootstrap the schema one at a time.
     static BOOTSTRAP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    pub(crate) const TEST_CHECKOUT_POOL: CheckoutPool = CheckoutPool {
+        connections: 4,
+        acquire_timeout: Duration::from_millis(200),
+    };
+
     pub(crate) async fn store() -> Option<PostgresStore> {
+        stores().await.map(|stores| stores.main)
+    }
+
+    pub(crate) async fn stores() -> Option<PostgresStores> {
         let Ok(url) = std::env::var("FIAT_TEST_DATABASE_URL") else {
             eprintln!("FIAT_TEST_DATABASE_URL unset: skipping the Postgres store test");
             return None;
         };
         let _bootstrap = BOOTSTRAP.lock().await;
         // Connecting twice proves the schema bootstrap is idempotent.
-        PostgresStore::connect(&url).await.expect("first connect");
-        Some(PostgresStore::connect(&url).await.expect("second connect"))
+        PostgresStore::connect(&url, TEST_CHECKOUT_POOL)
+            .await
+            .expect("first connect");
+        Some(
+            PostgresStore::connect(&url, TEST_CHECKOUT_POOL)
+                .await
+                .expect("second connect"),
+        )
     }
 
     fn new_row(creator: &str, bundle_id: &str) -> NewCorrelation {
@@ -1154,14 +1302,102 @@ pub(crate) mod postgres_tests {
     }
 
     #[tokio::test]
-    async fn the_pool_is_sized_by_the_shared_constant() {
-        let Some(store) = store().await else {
+    async fn the_pools_split_the_shared_connection_budget() {
+        let Some(stores) = stores().await else {
             return;
         };
         assert_eq!(
-            store.pool().options().get_max_connections(),
-            STORE_POOL_SIZE
+            stores.main.pool().options().get_max_connections(),
+            STORE_POOL_SIZE - TEST_CHECKOUT_POOL.connections
         );
+        assert_eq!(
+            stores.checkout.pool().options().get_max_connections(),
+            TEST_CHECKOUT_POOL.connections
+        );
+        assert_eq!(
+            stores.checkout.pool().options().get_acquire_timeout(),
+            TEST_CHECKOUT_POOL.acquire_timeout
+        );
+        let url = std::env::var("FIAT_TEST_DATABASE_URL").unwrap();
+        for connections in [0, STORE_POOL_SIZE] {
+            let refused = PostgresStore::connect(
+                &url,
+                CheckoutPool {
+                    connections,
+                    ..TEST_CHECKOUT_POOL
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(StoreError::Failed(_))),
+                "{connections}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_skipped_session_attempt_only_moves_forward_on_created_rows() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        store.insert_new(new_row(&creator, "SKIP1")).await.unwrap();
+        store
+            .skip_session_attempt(&creator, "SKIP1", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&creator, "SKIP1")
+                .await
+                .unwrap()
+                .unwrap()
+                .session_attempt,
+            2
+        );
+        store
+            .skip_session_attempt(&creator, "SKIP1", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&creator, "SKIP1")
+                .await
+                .unwrap()
+                .unwrap()
+                .session_attempt,
+            2,
+            "never backwards"
+        );
+        assert!(mint(&store, &creator, "SKIP1", "stripe", "cs_skip", 3).await);
+        assert_eq!(
+            store
+                .get(&creator, "SKIP1")
+                .await
+                .unwrap()
+                .unwrap()
+                .session_attempt,
+            3
+        );
+
+        paid_row(&store, &creator, "SKIP2", OffsetDateTime::now_utc()).await;
+        let before = store.get(&creator, "SKIP2").await.unwrap().unwrap();
+        store
+            .skip_session_attempt(&creator, "SKIP2", 5)
+            .await
+            .unwrap();
+        assert_unchanged(
+            &before,
+            &store.get(&creator, "SKIP2").await.unwrap().unwrap(),
+        );
+
+        store
+            .skip_session_attempt(&creator, "NOSUCHROW", 1)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

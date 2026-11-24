@@ -23,7 +23,7 @@ use crate::lock_fetch::PubkyCriterionSource;
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
 use crate::rate_limit::TokenBucket;
-use crate::store::{CorrelationStore, PostgresStore};
+use crate::store::{CheckoutPool, CorrelationStore, PostgresStore};
 use crate::stripe::StripeProcessor;
 use crate::verification::{ProcessorKind, Processors};
 
@@ -45,14 +45,19 @@ async fn main() {
         }
     };
 
-    let store: Arc<dyn CorrelationStore> = match PostgresStore::connect(&config.database_url).await
-    {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("database error: {error}");
-            std::process::exit(1);
-        }
+    let checkout_pool = CheckoutPool {
+        connections: u32::try_from(config.checkout_lookup_concurrency)
+            .expect("validated below STORE_POOL_SIZE by Config::from_env"),
+        acquire_timeout: config.checkout_lookup_wait,
     };
+    let (store, checkout_store): (Arc<dyn CorrelationStore>, Arc<dyn CorrelationStore>) =
+        match PostgresStore::connect(&config.database_url, checkout_pool).await {
+            Ok(stores) => (Arc::new(stores.main), Arc::new(stores.checkout)),
+            Err(error) => {
+                eprintln!("database error: {error}");
+                std::process::exit(1);
+            }
+        };
 
     let stripe = config.stripe.as_ref().map(|stripe_config| {
         Arc::new(StripeProcessor::new(
@@ -93,6 +98,7 @@ async fn main() {
     let state = Arc::new(AppState {
         trusted_key: config.trusted_locks_public_key,
         store,
+        checkout_store,
         processors: processors.clone(),
         default_processor,
         criterion_source: Arc::new(
