@@ -633,14 +633,25 @@ async fn persisted_session_after_lost_race(
     Err(ApiError::InvoiceConflict.into_response())
 }
 
+/// Whether a pull of this row would call a processor. A row bound to a
+/// processor this deployment does not configure is answered without a call,
+/// so it must never spend outbound budget meant for the configured rails.
+fn pull_reaches_processor(state: &AppState, correlation: &Correlation) -> bool {
+    bound_processor(correlation).is_some_and(|kind| state.processors.is_configured(kind))
+}
+
 /// Returns a fresh cached observation, or spends the outbound budget on a
-/// real pull. `None` means the budget prevented the pull.
+/// real pull. `None` means no pull happened: the row's processor is not
+/// configured, or the budget prevented the pull.
 async fn pull_for_status(
     state: &Arc<AppState>,
     correlation: &Correlation,
     purpose: StatusPullPurpose,
     now: OffsetDateTime,
 ) -> Option<PullOutcome> {
+    if !pull_reaches_processor(state, correlation) {
+        return None;
+    }
     if let Some(outcome) = state
         .status_pull_cache
         .get(correlation, state.status_pull_freshness)
@@ -771,7 +782,9 @@ async fn transaction_status(
             Report::PromotionDue { fallback } => {
                 // Promotion advances state and therefore always needs a real
                 // pull; it never reads the status cache.
-                let promoted = if take_status_pull(&state, StatusPullPurpose::Settlement) {
+                let promoted = if pull_reaches_processor(&state, &correlation)
+                    && take_status_pull(&state, StatusPullPurpose::Settlement)
+                {
                     promote_if_still_paid(&state.store, &state.processors, &correlation, now).await
                 } else {
                     false

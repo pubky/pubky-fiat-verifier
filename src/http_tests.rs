@@ -3098,3 +3098,123 @@ async fn promotion_with_an_empty_pull_budget_holds_a_paid_purchase_at_detected()
     );
     assert_eq!(harness.state(BUNDLE).await, CorrelationState::Paid);
 }
+
+/// Writes a Stripe-bound row straight into the store, as one left behind by
+/// a deployment that had Stripe configured.
+async fn stripe_row(harness: &Harness, bundle: &str, state: CorrelationState) {
+    assert_eq!(
+        harness
+            .store
+            .insert_new(NewCorrelation {
+                creator: CREATOR.to_owned(),
+                bundle_id: bundle.to_owned(),
+                lock_resource: format!("{CREATOR}/pub/locks.app/usd.json"),
+                reader: READER.to_owned(),
+                asset: "USD".to_owned(),
+                amount_minor: 1999,
+            })
+            .await
+            .unwrap(),
+        InsertOutcome::Inserted
+    );
+    let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    assert!(harness
+        .store
+        .set_session(
+            CREATOR,
+            bundle,
+            "stripe",
+            &format!("cs_{bundle}"),
+            "https://checkout.stripe.com/c/pay/disabled",
+            expires_at,
+            1,
+            None,
+        )
+        .await
+        .unwrap());
+    if state == CorrelationState::Created {
+        return;
+    }
+    let paid_at = OffsetDateTime::now_utc() - harness.settlement_delay - Duration::from_secs(60);
+    harness
+        .store
+        .mark_paid(
+            CREATOR,
+            bundle,
+            true,
+            Some(&format!("pi_{bundle}")),
+            paid_at,
+        )
+        .await
+        .unwrap();
+    if state == CorrelationState::Confirmed {
+        assert!(harness
+            .store
+            .mark_confirmed(CREATOR, bundle, OffsetDateTime::now_utc())
+            .await
+            .unwrap());
+    }
+    assert_eq!(harness.state(bundle).await, state);
+}
+
+#[tokio::test]
+async fn polls_of_a_disabled_processor_leave_the_pull_budget_to_the_enabled_one() {
+    let harness = build_harness(HarnessOptions {
+        with_stripe: false,
+        with_paypal: true,
+        status_pull_freshness: Duration::ZERO,
+        status_pull_bucket: (0, 1),
+        settlement_pull_bucket: (0, 1),
+        ..HarnessOptions::default()
+    })
+    .await;
+    confirm_paypal_purchase(&harness).await;
+    assert_eq!(
+        harness
+            .invoice("usd", "PAYPALPROMOTE1")
+            .await
+            .status()
+            .as_u16(),
+        204
+    );
+    harness.paypal_mock.complete("pporder_2");
+    let paid_at = OffsetDateTime::now_utc() - harness.settlement_delay - Duration::from_secs(60);
+    harness
+        .store
+        .mark_paid(
+            CREATOR,
+            "PAYPALPROMOTE1",
+            true,
+            Some("ppcap_pporder_2"),
+            paid_at,
+        )
+        .await
+        .unwrap();
+
+    stripe_row(&harness, "STRIPECONFIRMED1", CorrelationState::Confirmed).await;
+    stripe_row(&harness, "STRIPEPROMOTE1", CorrelationState::Paid).await;
+    stripe_row(&harness, "STRIPECREATED1", CorrelationState::Created).await;
+    let held = json!({"status": "detected", "confirmations": 0, "amount_matched": true});
+    assert_eq!(harness.status("STRIPECONFIRMED1").await, held);
+    assert_eq!(harness.status("STRIPEPROMOTE1").await, held);
+    assert_eq!(
+        harness.status("STRIPECREATED1").await,
+        json!({"status": "undetected", "confirmations": 0, "amount_matched": false})
+    );
+
+    let confirmed = json!({"status": "confirmed", "confirmations": 1, "amount_matched": true});
+    assert_eq!(
+        harness.status(BUNDLE).await,
+        confirmed,
+        "the confirmed PayPal purchase must still be re-pulled"
+    );
+    assert_eq!(
+        harness.status("PAYPALPROMOTE1").await,
+        confirmed,
+        "the due PayPal purchase must still be promoted"
+    );
+    assert_eq!(
+        harness.state("PAYPALPROMOTE1").await,
+        CorrelationState::Confirmed
+    );
+}
