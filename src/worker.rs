@@ -1,6 +1,6 @@
-//! Slow-poll fallback: a lost webhook delays a payment but never loses it
-//! (design §3.3.3). Every open fiat correlation with a session gets pulled on
-//! an interval; the same loop performs delay-elapsed promotion, in which case
+//! Slow-poll fallback for lost webhooks (design §3.3.3). The 200 oldest open
+//! fiat correlations with a session get pulled on an interval; newer rows rely
+//! on webhooks and status pulls while more are open. The same loop performs delay-elapsed promotion, in which case
 //! the pull that just happened IS the fresh promotion-time re-pull.
 //!
 //! The same loop is the reversal watch: confirmed correlations are re-pulled
