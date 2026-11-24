@@ -114,6 +114,10 @@ async fn main() {
         checkout_success_url: config.checkout_success_url.clone(),
         checkout_cancel_url: config.checkout_cancel_url.clone(),
         buyer_return_origins: config.buyer_return_origins.clone(),
+        checkout_lookup_limiter: TokenBucket::new(
+            config.checkout_lookup_rate_per_second,
+            config.checkout_lookup_rate_burst,
+        ),
         checkout_limiter: TokenBucket::new(
             config.checkout_rate_per_second,
             config.checkout_rate_burst,

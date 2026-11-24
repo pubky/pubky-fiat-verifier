@@ -145,6 +145,10 @@ pub struct AppState {
     /// Exact `https://` origins a checkout request may name as
     /// `return_origin` (canonical `url::Url` serializations).
     pub buyer_return_origins: Vec<String>,
+    /// Admits well-formed checkout requests to the correlation lookup, before
+    /// any database access, so checkout reads cannot crowd the store pool
+    /// shared with status and webhook work.
+    pub checkout_lookup_limiter: TokenBucket,
     /// Charged only when a checkout request mints a new session.
     pub checkout_limiter: TokenBucket,
     pub status_pull_cache: StatusPullCache,
@@ -841,6 +845,9 @@ async fn checkout_session(
     };
     if !state.processors.any_configured() {
         return ApiError::Unavailable.into_response();
+    }
+    if !state.checkout_lookup_limiter.try_take() {
+        return ApiError::RateLimited.into_response();
     }
     let correlation = match state.store.get(&request.creator, &request.bundle_id).await {
         Ok(Some(correlation)) if correlation.asset != "BTC" => correlation,

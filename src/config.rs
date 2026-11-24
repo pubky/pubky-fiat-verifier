@@ -92,6 +92,9 @@ pub struct Config {
     /// Max content-lock document size fetched from a homeserver.
     pub lock_resource_max_bytes: u64,
     pub lock_fetch_timeout: Duration,
+    /// Admission budget for /checkout-sessions correlation lookups.
+    pub checkout_lookup_rate_per_second: u64,
+    pub checkout_lookup_rate_burst: u64,
     /// Session-mint budget for the buyer-facing /checkout-sessions.
     pub checkout_rate_per_second: u64,
     pub checkout_rate_burst: u64,
@@ -281,6 +284,14 @@ impl Config {
                 "FIAT_LOCK_FETCH_TIMEOUT_SECONDS",
                 10,
             )?),
+            checkout_lookup_rate_per_second: positive(
+                "FIAT_CHECKOUT_LOOKUP_RATE_PER_SECOND",
+                parse_u64("FIAT_CHECKOUT_LOOKUP_RATE_PER_SECOND", 20)?,
+            )?,
+            checkout_lookup_rate_burst: positive(
+                "FIAT_CHECKOUT_LOOKUP_RATE_BURST",
+                parse_u64("FIAT_CHECKOUT_LOOKUP_RATE_BURST", 60)?,
+            )?,
             checkout_rate_per_second: parse_u64("FIAT_CHECKOUT_RATE_PER_SECOND", 5)?,
             checkout_rate_burst: parse_u64("FIAT_CHECKOUT_RATE_BURST", 20)?,
             status_pull_freshness: status_pull_freshness(parse_u64(
@@ -384,8 +395,8 @@ fn status_pull_freshness(seconds: u64) -> Result<Duration, ConfigError> {
     Ok(Duration::from_secs(seconds))
 }
 
-/// A zero pull rate or burst would silently stop status pulls, and with them
-/// every `confirmed` answer.
+/// A zero rate or burst would silently stop what its bucket admits: status
+/// pulls, and with them every `confirmed` answer, or every checkout lookup.
 fn positive(name: &'static str, value: u64) -> Result<u64, ConfigError> {
     if value == 0 {
         return Err(ConfigError::Invalid(name, "must be positive".to_owned()));

@@ -560,9 +560,15 @@ pub mod memory {
         rows: Mutex<HashMap<(String, String), Correlation>>,
         meta: Mutex<HashMap<(String, String), RowMeta>>,
         events: Mutex<HashSet<String>>,
+        gets: std::sync::atomic::AtomicUsize,
     }
 
     impl MemoryStore {
+        /// Correlation reads served so far.
+        pub fn get_calls(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         pub fn meta(&self, creator: &str, bundle_id: &str) -> RowMeta {
             self.meta
                 .lock()
@@ -620,6 +626,7 @@ pub mod memory {
             creator: &str,
             bundle_id: &str,
         ) -> Result<Option<Correlation>, StoreError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self
                 .rows
                 .lock()

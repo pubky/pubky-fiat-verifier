@@ -662,6 +662,8 @@ struct HarnessOptions {
     with_stripe: bool,
     with_paypal: bool,
     paypal_webhook_id: bool,
+    /// (rate per second, burst) of the checkout lookup admission limiter.
+    checkout_lookup_bucket: (u64, u64),
     /// (rate per second, burst) of the checkout-session limiter.
     checkout_bucket: (u64, u64),
     status_pull_freshness: Duration,
@@ -679,6 +681,7 @@ impl Default for HarnessOptions {
             with_stripe: true,
             with_paypal: false,
             paypal_webhook_id: true,
+            checkout_lookup_bucket: (100, 100),
             checkout_bucket: (100, 100),
             status_pull_freshness: Duration::from_secs(15),
             status_pull_bucket: (1000, 1000),
@@ -820,6 +823,10 @@ async fn build_harness_with_store(
         checkout_success_url: "https://app.test/success".into(),
         checkout_cancel_url: "https://app.test/cancel".into(),
         buyer_return_origins: vec![ORIGIN_A.into(), ORIGIN_B.into()],
+        checkout_lookup_limiter: TokenBucket::new(
+            options.checkout_lookup_bucket.0,
+            options.checkout_lookup_bucket.1,
+        ),
         checkout_limiter: TokenBucket::new(options.checkout_bucket.0, options.checkout_bucket.1),
         status_pull_cache: StatusPullCache::default(),
         status_pull_freshness: options.status_pull_freshness,
@@ -2638,12 +2645,15 @@ async fn paypal_dispute_lookup_outage_holds_confirmation() {
 #[tokio::test]
 async fn malformed_checkout_bodies_do_not_spend_the_checkout_budget() {
     let harness = build_harness(HarnessOptions {
-        checkout_bucket: (0, 3),
+        with_paypal: true,
+        checkout_lookup_bucket: (0, 1),
+        checkout_bucket: (0, 1),
         ..HarnessOptions::default()
     })
     .await;
     assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
 
+    let reads = harness.memory.get_calls();
     for _ in 0..3 {
         let junk = harness
             .http
@@ -2655,12 +2665,80 @@ async fn malformed_checkout_bodies_do_not_spend_the_checkout_budget() {
             .unwrap();
         assert_eq!(junk.status().as_u16(), 400);
     }
+    assert_eq!(
+        harness
+            .checkout(BUNDLE, Some("bitcoin"))
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_eq!(
+        harness
+            .checkout_with_origin(BUNDLE, Some("stripe"), Some("https://unlisted.example"))
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_eq!(harness.memory.get_calls(), reads);
 
-    let buyer = harness.checkout(BUNDLE, None).await;
+    let buyer = harness.checkout(BUNDLE, Some("stripe")).await;
     assert_eq!(
         buyer.status().as_u16(),
         200,
-        "a live session must be served after malformed requests"
+        "the only lookup and mint tokens must still be available"
+    );
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn checkout_lookups_over_the_admission_budget_never_reach_the_store() {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_lookup_bucket: (0, 2),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    assert_eq!(
+        harness
+            .checkout(BUNDLE, Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        harness
+            .checkout("UNKNOWNBUNDLE1", Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        404
+    );
+
+    let reads = harness.memory.get_calls();
+    for bundle in [BUNDLE, "UNKNOWNBUNDLE1"] {
+        assert_eq!(
+            harness
+                .checkout(bundle, Some("stripe"))
+                .await
+                .status()
+                .as_u16(),
+            429
+        );
+    }
+    assert_eq!(
+        harness.memory.get_calls(),
+        reads,
+        "a refused lookup must not read the store"
+    );
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+    assert_eq!(
+        harness.status(BUNDLE).await["status"],
+        "undetected",
+        "status requests do not draw from the checkout lookup budget"
     );
 }
 
@@ -2731,14 +2809,22 @@ async fn repeated_status_polls_of_a_confirmed_purchase_share_one_processor_pull(
 }
 
 #[tokio::test]
-async fn reused_live_sessions_do_not_spend_the_checkout_budget() {
+async fn reused_and_rejected_checkouts_do_not_spend_the_checkout_budget() {
     let harness = build_harness(HarnessOptions {
         with_paypal: true,
-        checkout_bucket: (0, 1),
+        checkout_bucket: (0, 2),
         ..HarnessOptions::default()
     })
     .await;
     assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    assert_eq!(
+        harness
+            .invoice("usd", "OTHERBUNDLE1")
+            .await
+            .status()
+            .as_u16(),
+        204
+    );
 
     let first = harness.checkout(BUNDLE, Some("stripe")).await;
     assert_eq!(first.status().as_u16(), 200);
@@ -2749,7 +2835,31 @@ async fn reused_live_sessions_do_not_spend_the_checkout_budget() {
         let reused: Value = reused.json().await.unwrap();
         assert_eq!(reused["checkout_url"], first["checkout_url"]);
     }
+    assert_eq!(
+        harness
+            .checkout(BUNDLE, Some("paypal"))
+            .await
+            .status()
+            .as_u16(),
+        409
+    );
+    assert_eq!(
+        harness
+            .checkout("UNKNOWNBUNDLE1", Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        404
+    );
     assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+
+    let other = harness.checkout("OTHERBUNDLE1", Some("stripe")).await;
+    assert_eq!(
+        other.status().as_u16(),
+        200,
+        "the second mint token must still be available"
+    );
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
