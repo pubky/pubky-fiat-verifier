@@ -145,10 +145,9 @@ pub struct AppState {
     /// Exact `https://` origins a checkout request may name as
     /// `return_origin` (canonical `url::Url` serializations).
     pub buyer_return_origins: Vec<String>,
-    /// Admits well-formed checkout requests to the correlation lookup, before
-    /// any database access, so checkout reads cannot crowd the store pool
-    /// shared with status and webhook work.
-    pub checkout_lookup_limiter: TokenBucket,
+    /// Bounds the store calls /checkout-sessions runs at once, so checkout
+    /// cannot take the pool connections status and webhook work needs.
+    pub checkout_db_gate: CheckoutDbGate,
     /// Charged only when a checkout request mints a new session.
     pub checkout_limiter: TokenBucket,
     pub status_pull_cache: StatusPullCache,
@@ -161,6 +160,66 @@ pub struct AppState {
     /// draw from it, so open unpaid sessions cannot starve settlement.
     pub settlement_pull_limiter: TokenBucket,
     pub pull_budget_refusals: RefusalLog,
+}
+
+/// Admission for the store calls of /checkout-sessions: each call holds one
+/// permit only while it runs, and never across a processor call. Waiters are
+/// served in arrival order. Permits are released on drop, so a request whose
+/// handler stops early never leaks one.
+pub struct CheckoutDbGate {
+    permits: Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+}
+
+impl CheckoutDbGate {
+    pub fn new(concurrency: usize, wait: Duration) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            wait,
+        }
+    }
+
+    /// Runs `call` under a permit. When none frees up within the wait,
+    /// `call` is never started and the request gets `ApiError::Busy`.
+    #[allow(clippy::result_large_err)]
+    async fn run<F, T>(&self, call: impl FnOnce() -> F) -> Result<T, Response>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let permit = match tokio::time::timeout(self.wait, self.permits.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => return Err(ApiError::Busy.into_response()),
+        };
+        let output = call().await;
+        drop(permit);
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    #[cfg(test)]
+    pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        self.permits.clone()
+    }
+}
+
+/// Runs a store call of the session mint: under the checkout gate when the
+/// checkout route minted, directly for the eager mint on /invoices.
+#[allow(clippy::result_large_err)]
+async fn mint_store_call<F, T>(
+    gate: Option<&CheckoutDbGate>,
+    call: impl FnOnce() -> F,
+) -> Result<T, Response>
+where
+    F: std::future::Future<Output = T>,
+{
+    match gate {
+        Some(gate) => gate.run(call).await,
+        None => Ok(call().await),
+    }
 }
 
 /// Which status pull is asking for outbound budget.
@@ -385,6 +444,7 @@ async fn create_invoice(
             // existed: idempotently create it now.
             match mint_session(
                 &state,
+                None,
                 kind,
                 creator,
                 &request.bundle_id,
@@ -412,6 +472,7 @@ async fn create_invoice(
             };
             match mint_session(
                 &state,
+                None,
                 kind,
                 creator,
                 &request.bundle_id,
@@ -455,9 +516,16 @@ fn return_urls(state: &AppState, return_origin: Option<&str>) -> (String, String
     }
 }
 
+/// Creates a processor session and persists it. `gate` is the checkout
+/// route's admission gate (`None` for the eager mint on /invoices); it covers
+/// only the store calls, never the processor call. When a store call cannot
+/// be admitted after the processor session exists, the row keeps its
+/// previous `session_attempt`, so a retry reuses the same idempotency key
+/// and gets the same processor session back.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn mint_session(
     state: &Arc<AppState>,
+    gate: Option<&CheckoutDbGate>,
     kind: ProcessorKind,
     creator: &str,
     bundle_id: &str,
@@ -473,6 +541,7 @@ async fn mint_session(
             };
             mint_stripe_session(
                 state,
+                gate,
                 stripe,
                 creator,
                 bundle_id,
@@ -508,9 +577,8 @@ async fn mint_session(
                 ApiError::Unavailable.into_response()
             })?;
             let expires_at = OffsetDateTime::now_utc().unix_timestamp() + PAYPAL_ORDER_TTL_SECONDS;
-            let persisted = state
-                .store
-                .set_session(
+            let persisted = mint_store_call(gate, || {
+                state.store.set_session(
                     creator,
                     bundle_id,
                     ProcessorKind::Paypal.as_str(),
@@ -520,13 +588,14 @@ async fn mint_session(
                     attempt,
                     return_origin,
                 )
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "failed to persist paypal order");
-                    ApiError::Unavailable.into_response()
-                })?;
+            })
+            .await?
+            .map_err(|error| {
+                tracing::error!(%error, "failed to persist paypal order");
+                ApiError::Unavailable.into_response()
+            })?;
             if !persisted {
-                return persisted_session_after_lost_race(state, creator, bundle_id).await;
+                return persisted_session_after_lost_race(state, gate, creator, bundle_id).await;
             }
             Ok(CheckoutSessionResponse {
                 checkout_url: approval_url,
@@ -540,6 +609,7 @@ async fn mint_session(
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn mint_stripe_session(
     state: &Arc<AppState>,
+    gate: Option<&CheckoutDbGate>,
     stripe: &Arc<StripeProcessor>,
     creator: &str,
     bundle_id: &str,
@@ -569,9 +639,8 @@ async fn mint_stripe_session(
         ApiError::Unavailable.into_response()
     })?;
     let expires_at = session.expires_at.unwrap_or(0);
-    let persisted = state
-        .store
-        .set_session(
+    let persisted = mint_store_call(gate, || {
+        state.store.set_session(
             creator,
             bundle_id,
             ProcessorKind::Stripe.as_str(),
@@ -581,13 +650,14 @@ async fn mint_stripe_session(
             attempt,
             return_origin,
         )
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to persist checkout session");
-            ApiError::Unavailable.into_response()
-        })?;
+    })
+    .await?
+    .map_err(|error| {
+        tracing::error!(%error, "failed to persist checkout session");
+        ApiError::Unavailable.into_response()
+    })?;
     if !persisted {
-        return persisted_session_after_lost_race(state, creator, bundle_id).await;
+        return persisted_session_after_lost_race(state, gate, creator, bundle_id).await;
     }
     Ok(CheckoutSessionResponse {
         checkout_url,
@@ -607,10 +677,11 @@ async fn mint_stripe_session(
 #[allow(clippy::result_large_err)]
 async fn persisted_session_after_lost_race(
     state: &Arc<AppState>,
+    gate: Option<&CheckoutDbGate>,
     creator: &str,
     bundle_id: &str,
 ) -> Result<CheckoutSessionResponse, Response> {
-    let correlation = match state.store.get(creator, bundle_id).await {
+    let correlation = match mint_store_call(gate, || state.store.get(creator, bundle_id)).await? {
         Ok(Some(correlation)) => correlation,
         Ok(None) => return Err(ApiError::InvoiceConflict.into_response()),
         Err(error) => {
@@ -846,10 +917,15 @@ async fn checkout_session(
     if !state.processors.any_configured() {
         return ApiError::Unavailable.into_response();
     }
-    if !state.checkout_lookup_limiter.try_take() {
-        return ApiError::RateLimited.into_response();
-    }
-    let correlation = match state.store.get(&request.creator, &request.bundle_id).await {
+    let gate = &state.checkout_db_gate;
+    let lookup = match gate
+        .run(|| state.store.get(&request.creator, &request.bundle_id))
+        .await
+    {
+        Ok(lookup) => lookup,
+        Err(busy) => return busy,
+    };
+    let correlation = match lookup {
         Ok(Some(correlation)) if correlation.asset != "BTC" => correlation,
         Ok(_) => return ApiError::NotFound.into_response(),
         Err(error) => {
@@ -914,6 +990,7 @@ async fn checkout_session(
     }
     match mint_session(
         &state,
+        Some(gate),
         kind,
         &request.creator,
         &request.bundle_id,

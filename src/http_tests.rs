@@ -24,7 +24,7 @@ use sha2::Sha256;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
-use crate::http::{router, AppState, RefusalLog, StatusPullCache};
+use crate::http::{router, AppState, CheckoutDbGate, RefusalLog, StatusPullCache};
 use crate::lock_fetch::{CriterionSource, LockCriterion, LockFetchError};
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -662,8 +662,8 @@ struct HarnessOptions {
     with_stripe: bool,
     with_paypal: bool,
     paypal_webhook_id: bool,
-    /// (rate per second, burst) of the checkout lookup admission limiter.
-    checkout_lookup_bucket: (u64, u64),
+    /// (permits, wait) of the checkout store-call gate.
+    checkout_db_gate: (usize, Duration),
     /// (rate per second, burst) of the checkout-session limiter.
     checkout_bucket: (u64, u64),
     status_pull_freshness: Duration,
@@ -681,7 +681,7 @@ impl Default for HarnessOptions {
             with_stripe: true,
             with_paypal: false,
             paypal_webhook_id: true,
-            checkout_lookup_bucket: (100, 100),
+            checkout_db_gate: (4, Duration::from_secs(2)),
             checkout_bucket: (100, 100),
             status_pull_freshness: Duration::from_secs(15),
             status_pull_bucket: (1000, 1000),
@@ -823,9 +823,9 @@ async fn build_harness_with_store(
         checkout_success_url: "https://app.test/success".into(),
         checkout_cancel_url: "https://app.test/cancel".into(),
         buyer_return_origins: vec![ORIGIN_A.into(), ORIGIN_B.into()],
-        checkout_lookup_limiter: TokenBucket::new(
-            options.checkout_lookup_bucket.0,
-            options.checkout_lookup_bucket.1,
+        checkout_db_gate: CheckoutDbGate::new(
+            options.checkout_db_gate.0,
+            options.checkout_db_gate.1,
         ),
         checkout_limiter: TokenBucket::new(options.checkout_bucket.0, options.checkout_bucket.1),
         status_pull_cache: StatusPullCache::default(),
@@ -2646,7 +2646,7 @@ async fn paypal_dispute_lookup_outage_holds_confirmation() {
 async fn malformed_checkout_bodies_do_not_spend_the_checkout_budget() {
     let harness = build_harness(HarnessOptions {
         with_paypal: true,
-        checkout_lookup_bucket: (0, 1),
+        checkout_db_gate: (1, Duration::from_millis(50)),
         checkout_bucket: (0, 1),
         ..HarnessOptions::default()
     })
@@ -2654,60 +2654,172 @@ async fn malformed_checkout_bodies_do_not_spend_the_checkout_budget() {
     assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
 
     let reads = harness.memory.get_calls();
-    for _ in 0..3 {
-        let junk = harness
-            .http
-            .post(format!("{}/checkout-sessions", harness.base))
-            .header("content-type", "application/json")
-            .body("not json")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(junk.status().as_u16(), 400);
+    {
+        // Every gate permit is held: a rejected body that reached the gate
+        // would answer 503 instead of 400.
+        let semaphore = harness.app.checkout_db_gate.semaphore();
+        let _held = semaphore.acquire().await.unwrap();
+        for _ in 0..3 {
+            let junk = harness
+                .http
+                .post(format!("{}/checkout-sessions", harness.base))
+                .header("content-type", "application/json")
+                .body("not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(junk.status().as_u16(), 400);
+        }
+        assert_eq!(
+            harness
+                .checkout(BUNDLE, Some("bitcoin"))
+                .await
+                .status()
+                .as_u16(),
+            400
+        );
+        assert_eq!(
+            harness
+                .checkout_with_origin(BUNDLE, Some("stripe"), Some("https://unlisted.example"))
+                .await
+                .status()
+                .as_u16(),
+            400
+        );
     }
-    assert_eq!(
-        harness
-            .checkout(BUNDLE, Some("bitcoin"))
-            .await
-            .status()
-            .as_u16(),
-        400
-    );
-    assert_eq!(
-        harness
-            .checkout_with_origin(BUNDLE, Some("stripe"), Some("https://unlisted.example"))
-            .await
-            .status()
-            .as_u16(),
-        400
-    );
     assert_eq!(harness.memory.get_calls(), reads);
 
     let buyer = harness.checkout(BUNDLE, Some("stripe")).await;
     assert_eq!(
         buyer.status().as_u16(),
         200,
-        "the only lookup and mint tokens must still be available"
+        "the only mint token must still be available"
     );
     assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
 }
 
+async fn checkout_request(base: &str, bundle: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/checkout-sessions"))
+        .json(&json!({"creator": CREATOR, "bundle_id": bundle, "processor": "stripe"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
 #[tokio::test]
-async fn checkout_lookups_over_the_admission_budget_never_reach_the_store() {
+async fn unknown_bundle_lookups_cannot_lock_out_a_live_session_reuse() {
     let harness = build_harness(HarnessOptions {
         with_paypal: true,
-        checkout_lookup_bucket: (0, 2),
+        checkout_bucket: (0, 1),
         ..HarnessOptions::default()
     })
     .await;
     assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    let first = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(first.status().as_u16(), 200);
+    let first: Value = first.json().await.unwrap();
+
+    // Waves of 50 concurrent lookups keep the test under the local listen
+    // backlog while still contending for the four permits.
+    for wave in 0..6 {
+        let mut burst = tokio::task::JoinSet::new();
+        for index in 0..50 {
+            let base = harness.base.clone();
+            let bundle = format!("UNKNOWNBUNDLE{wave}X{index}");
+            burst.spawn(async move { checkout_request(&base, &bundle).await });
+        }
+        while let Some(status) = burst.join_next().await {
+            assert_eq!(status.unwrap(), 404);
+        }
+    }
+
+    let reused = harness.checkout(BUNDLE, Some("stripe")).await;
     assert_eq!(
-        harness
-            .checkout(BUNDLE, Some("stripe"))
-            .await
-            .status()
-            .as_u16(),
-        200
+        reused.status().as_u16(),
+        200,
+        "unknown-bundle traffic must not lock out a buyer"
+    );
+    let reused: Value = reused.json().await.unwrap();
+    assert_eq!(reused["checkout_url"], first["checkout_url"]);
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+    assert_eq!(harness.app.checkout_db_gate.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn checkout_lookups_beyond_the_concurrency_wait_get_503_without_a_store_call() {
+    let harness = build_harness(HarnessOptions {
+        checkout_db_gate: (2, Duration::from_millis(50)),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    {
+        let semaphore = harness.app.checkout_db_gate.semaphore();
+        let _held = semaphore.acquire_many(2).await.unwrap();
+        let reads = harness.memory.get_calls();
+        for bundle in [BUNDLE, "UNKNOWNBUNDLE1"] {
+            let busy = harness.checkout(bundle, Some("stripe")).await;
+            assert_eq!(busy.status().as_u16(), 503);
+            assert_eq!(
+                busy.headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+                Some("1")
+            );
+            let body: Value = busy.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "busy");
+        }
+        assert_eq!(
+            harness.memory.get_calls(),
+            reads,
+            "a request refused by the gate must not read the store"
+        );
+
+        assert_eq!(
+            harness.status(BUNDLE).await["status"],
+            "undetected",
+            "status requests do not pass through the checkout gate"
+        );
+        assert_eq!(
+            harness
+                .invoice("usd", "OTHERBUNDLE1")
+                .await
+                .status()
+                .as_u16(),
+            204,
+            "invoices and their eager mint do not pass through the checkout gate"
+        );
+        assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 2);
+    }
+
+    let buyer = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(buyer.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn checkout_gate_permits_are_free_while_a_mint_waits_on_the_processor() {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_db_gate: (1, Duration::from_millis(50)),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let base = harness.base.clone();
+    let buyer = tokio::spawn(async move { checkout_request(&base, BUNDLE).await });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 1).await;
+
+    assert_eq!(
+        harness.app.checkout_db_gate.available_permits(),
+        1,
+        "no permit may be held across the processor call"
     );
     assert_eq!(
         harness
@@ -2718,28 +2830,166 @@ async fn checkout_lookups_over_the_admission_budget_never_reach_the_store() {
         404
     );
 
-    let reads = harness.memory.get_calls();
-    for bundle in [BUNDLE, "UNKNOWNBUNDLE1"] {
-        assert_eq!(
-            harness
-                .checkout(bundle, Some("stripe"))
+    release.send(()).unwrap();
+    assert_eq!(buyer.await.unwrap(), 200);
+    assert_eq!(harness.app.checkout_db_gate.available_permits(), 1);
+}
+
+/// The processor session exists, but the persist cannot get a gate permit:
+/// the buyer gets 503 with `Retry-After`, the row keeps its attempt, and the
+/// retry gets the same processor session back instead of a second one.
+async fn a_timed_out_session_persist_is_retried_with_the_same_session(processor: &str) {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_db_gate: (1, Duration::from_millis(50)),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let create_calls = match processor {
+        "stripe" => {
+            *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+            harness.stripe_mock.create_calls.clone()
+        }
+        _ => {
+            *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+            harness.paypal_mock.create_calls.clone()
+        }
+    };
+    let url = format!("{}/checkout-sessions", harness.base);
+    let body = json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": processor});
+    let buyer = {
+        let body = body.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .json(&body)
+                .send()
                 .await
-                .status()
-                .as_u16(),
-            429
-        );
-    }
+                .unwrap()
+        })
+    };
+    wait_for_create_calls(&create_calls, 1).await;
+
+    let held = harness
+        .app
+        .checkout_db_gate
+        .semaphore()
+        .acquire_owned()
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let busy = buyer.await.unwrap();
+    assert_eq!(busy.status().as_u16(), 503);
+    assert_eq!(
+        busy.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    drop(held);
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.session_attempt, 0);
+
+    let retry = harness.checkout(BUNDLE, Some(processor)).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry: Value = retry.json().await.unwrap();
+    assert_eq!(retry["processor"], processor);
+    assert_eq!(create_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let creates = match processor {
+        "stripe" => harness.stripe_mock.creates.lock().unwrap().clone(),
+        _ => harness.paypal_mock.creates.lock().unwrap().clone(),
+    };
+    assert_eq!(
+        creates.len(),
+        1,
+        "the retry must reuse the processor session, not create a second one"
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_attempt, 1);
+    let expected_session = match processor {
+        "stripe" => "cs_test_1",
+        _ => "pporder_1",
+    };
+    assert_eq!(row.session_id.as_deref(), Some(expected_session));
+}
+
+#[tokio::test]
+async fn a_timed_out_stripe_session_persist_is_retried_with_the_same_session() {
+    a_timed_out_session_persist_is_retried_with_the_same_session("stripe").await;
+}
+
+#[tokio::test]
+async fn a_timed_out_paypal_order_persist_is_retried_with_the_same_order() {
+    a_timed_out_session_persist_is_retried_with_the_same_session("paypal").await;
+}
+
+#[tokio::test]
+async fn a_lost_race_re_read_beyond_the_wait_gets_503_without_a_store_call() {
+    let harness = build_harness(HarnessOptions {
+        with_paypal: true,
+        checkout_db_gate: (1, Duration::from_millis(50)),
+        ..HarnessOptions::default()
+    })
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let base = harness.base.clone();
+    let stripe_buyer = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{base}/checkout-sessions"))
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": "stripe"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 1).await;
+    let paypal = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(paypal.status().as_u16(), 200);
+
+    // The Stripe persist loses to the PayPal binding and pauses inside the
+    // store call, holding the only permit. A waiter queued now gets that
+    // permit next, so the re-read that follows has to wait.
+    let (reached, resume) = harness.memory.pause_next_set_session();
+    release.send(()).unwrap();
+    reached.await.unwrap();
+    let semaphore = harness.app.checkout_db_gate.semaphore();
+    let mut queued = Box::pin(semaphore.acquire_owned());
+    let pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(queued.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(pending);
+    let reads = harness.memory.get_calls();
+    resume.send(()).unwrap();
+    let held = queued.await.unwrap();
+
+    let busy = stripe_buyer.await.unwrap();
+    assert_eq!(busy.status().as_u16(), 503);
+    assert_eq!(
+        busy.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
     assert_eq!(
         harness.memory.get_calls(),
         reads,
-        "a refused lookup must not read the store"
+        "a timed-out re-read must not read the store"
     );
+    drop(held);
+
+    let bound = harness.checkout(BUNDLE, None).await;
+    assert_eq!(bound.status().as_u16(), 200);
+    let bound: Value = bound.json().await.unwrap();
+    assert_eq!(bound["processor"], "paypal");
     assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
-    assert_eq!(
-        harness.status(BUNDLE).await["status"],
-        "undetected",
-        "status requests do not draw from the checkout lookup budget"
-    );
 }
 
 #[tokio::test]
@@ -3327,4 +3577,201 @@ async fn polls_of_a_disabled_processor_leave_the_pull_budget_to_the_enabled_one(
         harness.state("PAYPALPROMOTE1").await,
         CorrelationState::Confirmed
     );
+}
+
+/// The Postgres store, except that a read of a `HOLD` bundle runs on a pool
+/// connection it keeps until `release` turns true: a slow checkout lookup.
+struct HoldingReads {
+    inner: Arc<crate::store::PostgresStore>,
+    held: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CorrelationStore for HoldingReads {
+    async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError> {
+        self.inner.insert_new(new).await
+    }
+    async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError> {
+        use std::sync::atomic::Ordering;
+        if !bundle_id.starts_with("HOLD") {
+            return self.inner.get(creator, bundle_id).await;
+        }
+        let store_error = |error: sqlx::Error| StoreError(error.to_string());
+        let mut connection = self.inner.pool().acquire().await.map_err(store_error)?;
+        let now_held = self.held.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now_held, Ordering::SeqCst);
+        let mut release = self.release.clone();
+        let _ = release.wait_for(|released| *released).await;
+        let row = sqlx::query("SELECT 1 FROM correlations WHERE creator = $1 AND bundle_id = $2")
+            .bind(creator)
+            .bind(bundle_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(store_error)?;
+        self.held.fetch_sub(1, Ordering::SeqCst);
+        assert!(row.is_none(), "HOLD bundles are never invoiced");
+        Ok(None)
+    }
+    async fn set_session(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        processor: &str,
+        session_id: &str,
+        checkout_url: &str,
+        checkout_expires_at: i64,
+        session_attempt: i32,
+        return_origin: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .set_session(
+                creator,
+                bundle_id,
+                processor,
+                session_id,
+                checkout_url,
+                checkout_expires_at,
+                session_attempt,
+                return_origin,
+            )
+            .await
+    }
+    async fn mark_paid(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        amount_matched: bool,
+        payment_intent: Option<&str>,
+        paid_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .mark_paid(creator, bundle_id, amount_matched, payment_intent, paid_at)
+            .await
+    }
+    async fn mark_confirmed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        confirmed_at: OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .mark_confirmed(creator, bundle_id, confirmed_at)
+            .await
+    }
+    async fn mark_reversed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        reversed_at: OffsetDateTime,
+    ) -> Result<ReversalOutcome, StoreError> {
+        self.inner
+            .mark_reversed(creator, bundle_id, reversed_at)
+            .await
+    }
+    async fn find_by_payment_intent(
+        &self,
+        payment_intent: &str,
+    ) -> Result<Option<Correlation>, StoreError> {
+        self.inner.find_by_payment_intent(payment_intent).await
+    }
+    async fn record_webhook_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner.record_webhook_event(event_id, event_type).await
+    }
+    async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        self.inner.forget_webhook_event(event_id).await
+    }
+    async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
+        self.inner.open_fiat_correlations().await
+    }
+    async fn confirmed_due_for_reversal_check(
+        &self,
+        confirmed_after: OffsetDateTime,
+        checked_before: OffsetDateTime,
+    ) -> Result<Vec<Correlation>, StoreError> {
+        self.inner
+            .confirmed_due_for_reversal_check(confirmed_after, checked_before)
+            .await
+    }
+    async fn mark_reversal_checked(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .mark_reversal_checked(creator, bundle_id, checked_at)
+            .await
+    }
+    async fn healthy(&self) -> bool {
+        self.inner.healthy().await
+    }
+}
+
+#[tokio::test]
+async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
+    use std::sync::atomic::Ordering;
+    let Some(store) = crate::store::postgres_tests::store().await else {
+        return;
+    };
+    let concurrency = 4;
+    let (release, release_rx) = tokio::sync::watch::channel(false);
+    let holding = Arc::new(HoldingReads {
+        inner: Arc::new(store),
+        held: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        release: release_rx,
+    });
+    assert_eq!(
+        holding.inner.pool().options().get_max_connections(),
+        crate::store::STORE_POOL_SIZE
+    );
+    let harness = build_harness_with_store(
+        HarnessOptions {
+            checkout_db_gate: (concurrency, Duration::from_secs(10)),
+            ..HarnessOptions::default()
+        },
+        Some(holding.clone()),
+    )
+    .await;
+    let run = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let bundle = format!("HEADROOM{run}");
+    assert_eq!(harness.invoice("usd", &bundle).await.status().as_u16(), 204);
+
+    let mut flood = tokio::task::JoinSet::new();
+    for index in 0..crate::store::STORE_POOL_SIZE * 2 {
+        let base = harness.base.clone();
+        flood.spawn(async move { checkout_request(&base, &format!("HOLD{run}X{index}")).await });
+    }
+    for _ in 0..2500 {
+        if holding.held.load(Ordering::SeqCst) >= concurrency {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(holding.held.load(Ordering::SeqCst), concurrency);
+    // Room for any lookup that slipped past the gate to take a connection.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(holding.peak.load(Ordering::SeqCst), concurrency);
+
+    let status = tokio::time::timeout(Duration::from_secs(3), harness.status(&bundle))
+        .await
+        .expect("a status poll must still get a connection");
+    assert_eq!(status["status"], "undetected");
+    let other = format!("HEADROOMOTHER{run}");
+    let invoice = tokio::time::timeout(Duration::from_secs(3), harness.invoice("usd", &other))
+        .await
+        .expect("an invoice write must still get a connection");
+    assert_eq!(invoice.status().as_u16(), 204);
+
+    release.send(true).unwrap();
+    while let Some(status) = flood.join_next().await {
+        assert_eq!(status.unwrap(), 404);
+    }
+    assert_eq!(holding.peak.load(Ordering::SeqCst), concurrency);
 }

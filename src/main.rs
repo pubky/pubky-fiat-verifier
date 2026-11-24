@@ -18,7 +18,7 @@ mod worker;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::http::{AppState, RefusalLog, StatusPullCache};
+use crate::http::{AppState, CheckoutDbGate, RefusalLog, StatusPullCache};
 use crate::lock_fetch::PubkyCriterionSource;
 use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
@@ -114,9 +114,9 @@ async fn main() {
         checkout_success_url: config.checkout_success_url.clone(),
         checkout_cancel_url: config.checkout_cancel_url.clone(),
         buyer_return_origins: config.buyer_return_origins.clone(),
-        checkout_lookup_limiter: TokenBucket::new(
-            config.checkout_lookup_rate_per_second,
-            config.checkout_lookup_rate_burst,
+        checkout_db_gate: CheckoutDbGate::new(
+            config.checkout_lookup_concurrency,
+            config.checkout_lookup_wait,
         ),
         checkout_limiter: TokenBucket::new(
             config.checkout_rate_per_second,

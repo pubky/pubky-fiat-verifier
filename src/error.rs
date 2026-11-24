@@ -3,7 +3,7 @@
 //! from the service it impersonates.
 
 use axum::{
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -24,6 +24,9 @@ pub enum ApiError {
     /// or persistence failure). Non-409 invoice failures fail the proof-bundle
     /// submission upstream, which is the designed fail-closed behavior.
     Unavailable,
+    /// Every checkout database slot stayed busy for the whole admission
+    /// wait. Answered with `Retry-After: 1`.
+    Busy,
 }
 
 #[derive(Serialize)]
@@ -80,6 +83,11 @@ impl ApiError {
                 "fiat_unavailable",
                 "fiat payment processing is unavailable",
             ),
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "checkout is busy; retry shortly",
+            ),
         }
     }
 }
@@ -87,12 +95,18 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.details();
-        (
+        let mut response = (
             status,
             Json(ErrorEnvelope {
                 error: ErrorBody { code, message },
             }),
         )
-            .into_response()
+            .into_response();
+        if self == Self::Busy {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }

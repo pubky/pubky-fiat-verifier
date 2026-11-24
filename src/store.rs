@@ -230,10 +230,14 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 );
 "#;
 
+/// Connections in the Postgres pool. The checkout lookup concurrency is
+/// validated against this value, so checkout can never hold every connection.
+pub const STORE_POOL_SIZE: u32 = 10;
+
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(STORE_POOL_SIZE)
             .connect(database_url)
             .await
             .map_err(|error| StoreError(error.to_string()))?;
@@ -242,6 +246,11 @@ impl PostgresStore {
             .await
             .map_err(|error| StoreError(error.to_string()))?;
         Ok(Self { pool })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 }
 
@@ -561,12 +570,80 @@ pub mod memory {
         meta: Mutex<HashMap<(String, String), RowMeta>>,
         events: Mutex<HashSet<String>>,
         gets: std::sync::atomic::AtomicUsize,
+        set_session_pause: Mutex<Option<SetSessionPause>>,
+    }
+
+    /// Signals `reached` once the next `set_session` has been applied, then
+    /// holds that call until `resume` fires.
+    struct SetSessionPause {
+        reached: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
     }
 
     impl MemoryStore {
         /// Correlation reads served so far.
         pub fn get_calls(&self) -> usize {
             self.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Pauses the next `set_session` after it is applied. Returns the
+        /// receiver that fires when the call reaches the pause and the
+        /// sender that lets it return.
+        pub fn pause_next_set_session(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            *self.set_session_pause.lock().unwrap() = Some(SetSessionPause {
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+            (reached_rx, resume_tx)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn apply_session(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            processor: &str,
+            session_id: &str,
+            checkout_url: &str,
+            checkout_expires_at: i64,
+            session_attempt: i32,
+            return_origin: Option<&str>,
+        ) -> bool {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) else {
+                return false;
+            };
+            if row.state != CorrelationState::Created {
+                return false;
+            }
+            // Same origin guard as the SQL predicate: apply only while the
+            // row is unbound or bound to exactly the minted origin. (When
+            // `return_origin` is None this reduces to `is_none()`.)
+            if row.return_origin.is_some() && row.return_origin.as_deref() != return_origin {
+                return false;
+            }
+            let wholly_unbound = row.processor.is_none() && row.session_id.is_none();
+            let effective_processor = crate::verification::bound_processor(row)
+                .map(crate::verification::ProcessorKind::as_str);
+            if !wholly_unbound && effective_processor != Some(processor) {
+                return false;
+            }
+            row.processor = Some(processor.to_owned());
+            row.session_id = Some(session_id.to_owned());
+            row.checkout_url = Some(checkout_url.to_owned());
+            row.checkout_expires_at = Some(checkout_expires_at);
+            row.session_attempt = session_attempt;
+            if let Some(origin) = return_origin {
+                row.return_origin = Some(origin.to_owned());
+            }
+            true
         }
 
         pub fn meta(&self, creator: &str, bundle_id: &str) -> RowMeta {
@@ -646,34 +723,22 @@ pub mod memory {
             session_attempt: i32,
             return_origin: Option<&str>,
         ) -> Result<bool, StoreError> {
-            let mut rows = self.rows.lock().unwrap();
-            let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) else {
-                return Ok(false);
-            };
-            if row.state != CorrelationState::Created {
-                return Ok(false);
+            let applied = self.apply_session(
+                creator,
+                bundle_id,
+                processor,
+                session_id,
+                checkout_url,
+                checkout_expires_at,
+                session_attempt,
+                return_origin,
+            );
+            let pause = self.set_session_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
             }
-            // Same origin guard as the SQL predicate: apply only while the
-            // row is unbound or bound to exactly the minted origin. (When
-            // `return_origin` is None this reduces to `is_none()`.)
-            if row.return_origin.is_some() && row.return_origin.as_deref() != return_origin {
-                return Ok(false);
-            }
-            let wholly_unbound = row.processor.is_none() && row.session_id.is_none();
-            let effective_processor = crate::verification::bound_processor(row)
-                .map(crate::verification::ProcessorKind::as_str);
-            if !wholly_unbound && effective_processor != Some(processor) {
-                return Ok(false);
-            }
-            row.processor = Some(processor.to_owned());
-            row.session_id = Some(session_id.to_owned());
-            row.checkout_url = Some(checkout_url.to_owned());
-            row.checkout_expires_at = Some(checkout_expires_at);
-            row.session_attempt = session_attempt;
-            if let Some(origin) = return_origin {
-                row.return_origin = Some(origin.to_owned());
-            }
-            Ok(true)
+            Ok(applied)
         }
 
         async fn mark_paid(
@@ -1086,6 +1151,17 @@ pub(crate) mod postgres_tests {
 
     fn assert_unchanged(before: &Correlation, after: &Correlation) {
         assert_eq!(format!("{before:?}"), format!("{after:?}"));
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_sized_by_the_shared_constant() {
+        let Some(store) = store().await else {
+            return;
+        };
+        assert_eq!(
+            store.pool().options().get_max_connections(),
+            STORE_POOL_SIZE
+        );
     }
 
     #[tokio::test]
