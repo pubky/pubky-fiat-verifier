@@ -98,8 +98,8 @@ pub enum ReversalOutcome {
 pub enum StoreError {
     #[error("correlation store error: {0}")]
     Failed(String),
-    /// No pooled connection became free within the pool's acquire timeout;
-    /// the statement never ran.
+    /// No pooled connection became free, and no new one opened, within the
+    /// pool's acquire timeout; the statement never ran.
     #[error("correlation store busy: no pooled connection within the wait")]
     Busy,
 }
@@ -114,7 +114,9 @@ pub trait CorrelationStore: Send + Sync {
     /// (NULL processor and session), or its effective value must equal the
     /// minted processor; a legacy row with a session and NULL processor is
     /// effectively Stripe. Thus the first persisted processor wins, while a
-    /// same-processor re-mint remains valid. Returns `false` when any guard
+    /// same-processor re-mint remains valid. An attempt older than the
+    /// stored `session_attempt` never applies, so a late persist cannot
+    /// replace a newer session. Returns `false` when any guard
     /// rejects the write; the caller must not serve the session it minted.
     #[allow(clippy::too_many_arguments)]
     async fn set_session(
@@ -407,6 +409,7 @@ impl CorrelationStore for PostgresStore {
              checkout_expires_at = $6, session_attempt = $7, \
              return_origin = COALESCE($8, return_origin), updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2 AND state = 'created' \
+             AND session_attempt <= $7 \
              AND (return_origin IS NULL OR return_origin = $8) \
              AND ((processor IS NULL AND session_id IS NULL) \
                   OR COALESCE(processor, CASE WHEN session_id IS NOT NULL THEN 'stripe' END) = $3)",
@@ -698,6 +701,9 @@ pub mod memory {
                 return false;
             };
             if row.state != CorrelationState::Created {
+                return false;
+            }
+            if session_attempt < row.session_attempt {
                 return false;
             }
             // Same origin guard as the SQL predicate: apply only while the
@@ -1052,6 +1058,23 @@ pub mod memory {
             store.get(CREATOR, bundle_id).await.unwrap().unwrap()
         }
 
+        async fn row_id(store: &MemoryStore, bundle_id: &str) -> Option<String> {
+            row(store, bundle_id).await.session_id
+        }
+
+        #[tokio::test]
+        async fn set_session_never_moves_the_attempt_backwards() {
+            let store = MemoryStore::default();
+            insert(&store, "BACK").await;
+            assert!(mint(&store, "BACK", "stripe", "cs_new", 2).await);
+            assert!(!mint(&store, "BACK", "stripe", "cs_old", 1).await);
+            let row = row(&store, "BACK").await;
+            assert_eq!(row.session_id.as_deref(), Some("cs_new"));
+            assert_eq!(row.session_attempt, 2);
+            assert!(mint(&store, "BACK", "stripe", "cs_same", 2).await);
+            assert_eq!(row_id(&store, "BACK").await, Some("cs_same".to_owned()));
+        }
+
         #[tokio::test]
         async fn a_skipped_session_attempt_only_moves_forward_on_created_rows() {
             let store = MemoryStore::default();
@@ -1196,9 +1219,12 @@ pub(crate) mod postgres_tests {
     /// Postgres, so the tests bootstrap the schema one at a time.
     static BOOTSTRAP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// The acquire timeout also bounds opening a connection (sqlx-core
+    /// 0.8.6 `pool/inner.rs`), so it leaves room for connection setup on a
+    /// loaded machine. Tests that assert a pool timeout use `stores_with`.
     pub(crate) const TEST_CHECKOUT_POOL: CheckoutPool = CheckoutPool {
         connections: 4,
-        acquire_timeout: Duration::from_millis(200),
+        acquire_timeout: Duration::from_secs(10),
     };
 
     pub(crate) async fn store() -> Option<PostgresStore> {
@@ -1206,17 +1232,21 @@ pub(crate) mod postgres_tests {
     }
 
     pub(crate) async fn stores() -> Option<PostgresStores> {
+        stores_with(TEST_CHECKOUT_POOL).await
+    }
+
+    pub(crate) async fn stores_with(checkout: CheckoutPool) -> Option<PostgresStores> {
         let Ok(url) = std::env::var("FIAT_TEST_DATABASE_URL") else {
             eprintln!("FIAT_TEST_DATABASE_URL unset: skipping the Postgres store test");
             return None;
         };
         let _bootstrap = BOOTSTRAP.lock().await;
         // Connecting twice proves the schema bootstrap is idempotent.
-        PostgresStore::connect(&url, TEST_CHECKOUT_POOL)
+        PostgresStore::connect(&url, checkout)
             .await
             .expect("first connect");
         Some(
-            PostgresStore::connect(&url, TEST_CHECKOUT_POOL)
+            PostgresStore::connect(&url, checkout)
                 .await
                 .expect("second connect"),
         )
@@ -1643,5 +1673,31 @@ pub(crate) mod postgres_tests {
             .record_webhook_event(&event_id, "charge.refunded")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_session_never_moves_the_attempt_backwards() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        store.insert_new(new_row(&creator, "BACK")).await.unwrap();
+        assert!(mint(&store, &creator, "BACK", "stripe", "cs_new", 2).await);
+        let older = mint(&store, &creator, "BACK", "stripe", "cs_old", 1).await;
+        let row = store.get(&creator, "BACK").await.unwrap().unwrap();
+        assert!(
+            !older,
+            "attempt 1 replaced attempt 2: row is {:?} at attempt {}",
+            row.session_id, row.session_attempt
+        );
+        assert_eq!(row.session_id.as_deref(), Some("cs_new"));
+        assert_eq!(row.session_attempt, 2);
+        assert!(
+            mint(&store, &creator, "BACK", "stripe", "cs_new", 2).await,
+            "re-persisting the same attempt stays allowed"
+        );
     }
 }

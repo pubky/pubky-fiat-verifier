@@ -96,6 +96,8 @@ struct MockStripe {
     create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     /// Checkout Session retrieve calls received.
     session_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, the next session created carries no `expires_at`.
+    omit_next_expires_at: Arc<Mutex<bool>>,
 }
 
 impl MockStripe {
@@ -206,7 +208,7 @@ async fn mock_create_session(
         .find_map(|pair| pair.strip_prefix("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D="))
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let session = json!({
+    let mut session = json!({
         "id": id,
         "object": "checkout.session",
         "url": format!("https://checkout.stripe.test/c/pay/{id}"),
@@ -218,6 +220,9 @@ async fn mock_create_session(
         "client_reference_id": format!("{CREATOR}_{BUNDLE}"),
         "livemode": false
     });
+    if std::mem::take(&mut *mock.omit_next_expires_at.lock().unwrap()) {
+        session.as_object_mut().unwrap().remove("expires_at");
+    }
     mock.sessions
         .lock()
         .unwrap()
@@ -338,6 +343,9 @@ struct MockPaypal {
     create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     /// When set, the next order created carries no `create_time`.
     omit_next_create_time: Arc<Mutex<bool>>,
+    /// Seconds added to the next created order's `create_time` (a
+    /// processor clock ahead of ours).
+    next_create_time_ahead: Arc<Mutex<i64>>,
     /// When set, `create_gate` waits for the next call that creates an
     /// order and lets request-id replays through.
     create_gate_skips_replays: Arc<Mutex<bool>>,
@@ -482,7 +490,10 @@ async fn mock_paypal_create_order(
         "status": "CREATED",
         "intent": parsed["intent"],
         "processing_instruction": parsed["processing_instruction"],
-        "create_time": OffsetDateTime::now_utc()
+        "create_time": (OffsetDateTime::now_utc()
+            + time::Duration::seconds(std::mem::take(
+                &mut *mock.next_create_time_ahead.lock().unwrap()
+            )))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap(),
         "purchase_units": [{
@@ -2289,7 +2300,7 @@ async fn stripe_concurrent_fallback_mint_over_expired_binding_conflicts() {
                 "cs_test_2",
                 winner["checkout_url"].as_str().unwrap(),
                 1,
-                2,
+                3,
                 Some(ORIGIN_A),
             )
             .await
@@ -3839,7 +3850,7 @@ async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
         let base = harness.base.clone();
         flood.spawn(async move { checkout_request(&base, &format!("HOLD{run}X{index}")).await });
     }
-    for _ in 0..2500 {
+    for _ in 0..5000 {
         if holding.held.load(Ordering::SeqCst) >= concurrency {
             break;
         }
@@ -3850,12 +3861,12 @@ async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(holding.peak.load(Ordering::SeqCst), concurrency);
 
-    let status = tokio::time::timeout(Duration::from_secs(3), harness.status(&bundle))
+    let status = tokio::time::timeout(Duration::from_secs(10), harness.status(&bundle))
         .await
         .expect("a status poll must still get a connection");
     assert_eq!(status["status"], "undetected");
     let other = format!("HEADROOMOTHER{run}");
-    let invoice = tokio::time::timeout(Duration::from_secs(3), harness.invoice("usd", &other))
+    let invoice = tokio::time::timeout(Duration::from_secs(10), harness.invoice("usd", &other))
         .await
         .expect("an invoice write must still get a connection");
     assert_eq!(invoice.status().as_u16(), 204);
@@ -3869,10 +3880,16 @@ async fn saturated_checkout_leaves_status_polls_answering_postgres_store() {
 
 #[tokio::test]
 async fn checkout_connections_still_returning_never_take_status_or_webhook_connections() {
-    let Some(stores) = crate::store::postgres_tests::stores().await else {
+    // A pool timeout well above connection setup time, so the pool's cap,
+    // not the clock, decides how many connections the loop below gets.
+    let checkout = crate::store::CheckoutPool {
+        connections: 4,
+        acquire_timeout: Duration::from_secs(3),
+    };
+    let Some(stores) = crate::store::postgres_tests::stores_with(checkout).await else {
         return;
     };
-    let checkout_connections = crate::store::postgres_tests::TEST_CHECKOUT_POOL.connections;
+    let checkout_connections = checkout.connections;
     let checkout_pool = stores.checkout.pool().clone();
     let main_pool = stores.main.pool().clone();
     let harness = build_harness_with_stores(
@@ -3892,18 +3909,19 @@ async fn checkout_connections_still_returning_never_take_status_or_webhook_conne
     // will hand out, as if all of them were mid-return at once.
     let mut returning = Vec::new();
     for _ in 0..crate::store::STORE_POOL_SIZE {
-        match tokio::time::timeout(Duration::from_millis(100), checkout_pool.acquire()).await {
-            Ok(Ok(connection)) => returning.push(connection),
-            Ok(Err(_)) | Err(_) => break,
+        match checkout_pool.acquire().await {
+            Ok(connection) => returning.push(connection),
+            Err(sqlx::Error::PoolTimedOut) => break,
+            Err(error) => panic!("checkout pool acquire failed: {error}"),
         }
     }
 
-    let status = tokio::time::timeout(Duration::from_secs(3), harness.status(&bundle))
+    let status = tokio::time::timeout(Duration::from_secs(10), harness.status(&bundle))
         .await
         .expect("a status poll must still get a connection");
     assert_eq!(status["status"], "undetected");
     let other = format!("RETURNINGOTHER{run}");
-    let invoice = tokio::time::timeout(Duration::from_secs(3), harness.invoice("usd", &other))
+    let invoice = tokio::time::timeout(Duration::from_secs(10), harness.invoice("usd", &other))
         .await
         .expect("an invoice write must still get a connection");
     assert_eq!(invoice.status().as_u16(), 204);
@@ -3913,7 +3931,7 @@ async fn checkout_connections_still_returning_never_take_status_or_webhook_conne
         "data": {"object": {"id": "cs_test_1",
             "client_reference_id": format!("{CREATOR}_{bundle}")}}
     });
-    let webhook = tokio::time::timeout(Duration::from_secs(3), harness.send_webhook(&event))
+    let webhook = tokio::time::timeout(Duration::from_secs(10), harness.send_webhook(&event))
         .await
         .expect("a webhook must still get a connection");
     assert_eq!(webhook.status().as_u16(), 200);
@@ -4274,4 +4292,365 @@ async fn a_paypal_retry_from_another_origin_after_a_persist_timeout_never_replay
     let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
     assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_B));
     assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+}
+
+/// Two checkouts straddle the 60 s slack of a replayed, never-persisted
+/// Stripe session. The first sees it live and persists late;
+/// the second sees it expired, skips attempt 1 and persists attempt 2. The
+/// late persist of attempt 1 must not replace attempt 2's session.
+#[tokio::test]
+async fn a_late_persist_of_an_older_attempt_never_replaces_a_newer_session() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    checkout_with_a_timed_out_persist(&harness, "stripe", None).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let before = harness
+        .stripe_mock
+        .create_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let first = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "processor": "stripe"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, before + 1).await;
+
+    harness.stripe_mock.set_expires_at("cs_test_1", now + 30);
+    let second = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(second.status().as_u16(), 200);
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(
+        second["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+
+    harness.stripe_mock.set_expires_at("cs_test_1", now + 90);
+    release.send(()).unwrap();
+    let first = first.await.unwrap();
+    assert_eq!(first.status().as_u16(), 200);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(
+        first["checkout_url"], second["checkout_url"],
+        "the late buyer is served the newer session"
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(
+        (row.session_id.as_deref(), row.session_attempt),
+        (Some("cs_test_2"), 2),
+        "first buyer was served {}",
+        first["checkout_url"]
+    );
+    harness.stripe_mock.set_payment_status("cs_test_2", "paid");
+    assert_eq!(harness.status(BUNDLE).await["status"], "detected");
+}
+
+/// A slow origin-A mint reads attempt 0 and is still inside its processor
+/// call while a fallback checkout persists attempt 1 and an origin-A
+/// checkout re-mints attempt 2. Its late persist of attempt 1 loses and it
+/// is served the newer session.
+#[tokio::test]
+async fn a_slow_origin_mint_never_replaces_a_newer_session_for_that_origin() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let slow = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE,
+                "processor": "stripe",
+                "return_origin": ORIGIN_A,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 1).await;
+
+    let legacy = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(legacy.status().as_u16(), 200);
+    let fresh = harness
+        .checkout_with_origin(BUNDLE, Some("stripe"), Some(ORIGIN_A))
+        .await;
+    assert_eq!(fresh.status().as_u16(), 200);
+    let fresh: Value = fresh.json().await.unwrap();
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_attempt, 2);
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+
+    release.send(()).unwrap();
+    let slow = slow.await.unwrap();
+    assert_eq!(slow.status().as_u16(), 200);
+    let slow: Value = slow.json().await.unwrap();
+    assert_eq!(slow["checkout_url"], fresh["checkout_url"]);
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(
+        (row.checkout_url.as_deref(), row.session_attempt),
+        (fresh["checkout_url"].as_str(), 2),
+        "slow origin-A buyer was served {}; newer origin-A buyer holds {}",
+        slow["checkout_url"],
+        fresh["checkout_url"]
+    );
+}
+
+#[tokio::test]
+async fn a_paypal_create_time_ahead_of_our_clock_never_extends_the_expiry() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    *harness.paypal_mock.next_create_time_ahead.lock().unwrap() = 2 * 3600;
+    let response = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let response: Value = response.json().await.unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    assert!(harness.paypal_mock.created_at("pporder_1") > now + 3600);
+    assert!(
+        expires_at(&response) <= now + 3 * 3600,
+        "expiry {} runs past now + 3 h ({})",
+        expires_at(&response),
+        now + 3 * 3600
+    );
+    assert!(expires_at(&response) >= now + 3 * 3600 - 5);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.checkout_expires_at, Some(expires_at(&response)));
+}
+
+#[tokio::test]
+async fn a_stripe_session_without_expires_at_is_not_persisted() {
+    let harness = harness_with_both_processors_and_a_short_gate().await;
+    *harness.stripe_mock.omit_next_expires_at.lock().unwrap() = true;
+    let response = harness.checkout(BUNDLE, Some("stripe")).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id, None);
+    assert_eq!(row.processor, None);
+    assert_eq!(row.checkout_expires_at, None);
+}
+
+/// A store that records each call it receives before delegating.
+struct RecordingStore {
+    inner: Arc<MemoryStore>,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl RecordingStore {
+    fn new(inner: Arc<MemoryStore>) -> Self {
+        Self {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn take(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl CorrelationStore for RecordingStore {
+    async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError> {
+        self.record("insert_new");
+        self.inner.insert_new(new).await
+    }
+    async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError> {
+        self.record("get");
+        self.inner.get(creator, bundle_id).await
+    }
+    async fn set_session(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        processor: &str,
+        session_id: &str,
+        checkout_url: &str,
+        checkout_expires_at: i64,
+        session_attempt: i32,
+        return_origin: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.record("set_session");
+        self.inner
+            .set_session(
+                creator,
+                bundle_id,
+                processor,
+                session_id,
+                checkout_url,
+                checkout_expires_at,
+                session_attempt,
+                return_origin,
+            )
+            .await
+    }
+    async fn skip_session_attempt(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_attempt: i32,
+    ) -> Result<(), StoreError> {
+        self.record("skip_session_attempt");
+        self.inner
+            .skip_session_attempt(creator, bundle_id, session_attempt)
+            .await
+    }
+    async fn mark_paid(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        amount_matched: bool,
+        payment_intent: Option<&str>,
+        paid_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.record("mark_paid");
+        self.inner
+            .mark_paid(creator, bundle_id, amount_matched, payment_intent, paid_at)
+            .await
+    }
+    async fn mark_confirmed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        confirmed_at: OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        self.record("mark_confirmed");
+        self.inner
+            .mark_confirmed(creator, bundle_id, confirmed_at)
+            .await
+    }
+    async fn mark_reversed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        reversed_at: OffsetDateTime,
+    ) -> Result<ReversalOutcome, StoreError> {
+        self.record("mark_reversed");
+        self.inner
+            .mark_reversed(creator, bundle_id, reversed_at)
+            .await
+    }
+    async fn find_by_payment_intent(
+        &self,
+        payment_intent: &str,
+    ) -> Result<Option<Correlation>, StoreError> {
+        self.record("find_by_payment_intent");
+        self.inner.find_by_payment_intent(payment_intent).await
+    }
+    async fn record_webhook_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, StoreError> {
+        self.record("record_webhook_event");
+        self.inner.record_webhook_event(event_id, event_type).await
+    }
+    async fn forget_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        self.record("forget_webhook_event");
+        self.inner.forget_webhook_event(event_id).await
+    }
+    async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
+        self.record("open_fiat_correlations");
+        self.inner.open_fiat_correlations().await
+    }
+    async fn confirmed_due_for_reversal_check(
+        &self,
+        confirmed_after: OffsetDateTime,
+        checked_before: OffsetDateTime,
+    ) -> Result<Vec<Correlation>, StoreError> {
+        self.record("confirmed_due_for_reversal_check");
+        self.inner
+            .confirmed_due_for_reversal_check(confirmed_after, checked_before)
+            .await
+    }
+    async fn mark_reversal_checked(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        checked_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.record("mark_reversal_checked");
+        self.inner
+            .mark_reversal_checked(creator, bundle_id, checked_at)
+            .await
+    }
+    async fn healthy(&self) -> bool {
+        self.record("healthy");
+        self.inner.healthy().await
+    }
+}
+
+/// Every store call a checkout makes, including the persist, the skip of
+/// an expired replayed attempt and the re-read after a lost race, runs on
+/// the checkout store and never on the store status polls and webhooks
+/// use.
+#[tokio::test]
+async fn checkout_persists_skips_and_re_reads_only_on_the_checkout_store() {
+    let rows = Arc::new(MemoryStore::default());
+    let main = Arc::new(RecordingStore::new(rows.clone()));
+    let checkout = Arc::new(RecordingStore::new(rows.clone()));
+    let harness = build_harness_with_stores(
+        HarnessOptions {
+            with_paypal: true,
+            checkout_db_gate: (1, Duration::from_millis(50)),
+            ..HarnessOptions::default()
+        },
+        Some((main.clone(), checkout.clone())),
+    )
+    .await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    assert_eq!(
+        harness.invoice("usd", "ROUTE2").await.status().as_u16(),
+        204
+    );
+    checkout_with_a_timed_out_persist(&harness, "paypal", None).await;
+    harness
+        .paypal_mock
+        .backdate("pporder_1", Duration::from_secs(4 * 3600));
+    main.take();
+    checkout.take();
+
+    // The retry skips the expired replayed attempt and persists the next.
+    let retry = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(retry.status().as_u16(), 200);
+    let calls = checkout.take();
+    assert!(calls.contains(&"skip_session_attempt"), "{calls:?}");
+    assert!(calls.contains(&"set_session"), "{calls:?}");
+    assert_eq!(main.take(), Vec::<&str>::new());
+
+    // A Stripe mint loses the binding race to a PayPal persist and re-reads
+    // the winner.
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let url = format!("{}/checkout-sessions", harness.base);
+    let slow = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": "ROUTE2", "processor": "stripe"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 1).await;
+    let winner = harness.checkout("ROUTE2", Some("paypal")).await;
+    assert_eq!(winner.status().as_u16(), 200);
+    let winner: Value = winner.json().await.unwrap();
+    checkout.take();
+    release.send(()).unwrap();
+    let slow = slow.await.unwrap();
+    assert_eq!(slow.status().as_u16(), 200);
+    let slow: Value = slow.json().await.unwrap();
+    assert_eq!(slow["checkout_url"], winner["checkout_url"]);
+    assert_eq!(checkout.take(), vec!["set_session", "get"]);
+    assert_eq!(main.take(), Vec::<&str>::new());
 }

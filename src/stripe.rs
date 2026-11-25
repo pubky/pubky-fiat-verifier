@@ -1,7 +1,8 @@
 //! Stripe processor plugin (test mode). Three responsibilities, kept honest:
 //!
 //! 1. `create_checkout_session` — hosted Checkout, idempotently keyed to the
-//!    verification task (`creator‖bundle_id`), so replays mint no duplicates.
+//!    verification task's attempt and redirect URLs (`idempotency_key`), so
+//!    a retry of the same attempt from the same origin mints no duplicate.
 //! 2. `retrieve_*` — the API pull. Pulled state is the ONLY thing that
 //!    advances a correlation; webhooks merely schedule pulls.
 //! 3. `verify_webhook` — constructed-event verification of the

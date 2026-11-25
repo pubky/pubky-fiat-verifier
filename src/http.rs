@@ -599,7 +599,7 @@ async fn mint_session(
             attempt,
             session_id = %minted.session_id,
             expires_at = minted.expires_at,
-            "processor replayed an expired, never-served session; skipping its attempt"
+            "processor replayed an expired session this row never persisted; skipping its attempt"
         );
         if attempt != first_attempt {
             return Err(ApiError::Busy.into_response());
@@ -730,7 +730,8 @@ async fn create_processor_session(
 
 /// The conditional persist of a just-minted session lost the race: between
 /// the pre-mint read and the UPDATE, a concurrent mint bound the correlation
-/// to a different return origin or processor, or the row left `created`.
+/// to a different return origin or processor, persisted a newer attempt,
+/// or the row left `created`.
 /// The session we minted is never served over that persisted state; re-read
 /// the winner instead. When the winning session is still live it is served,
 /// because the store guards keep its processor and derived redirect URLs
