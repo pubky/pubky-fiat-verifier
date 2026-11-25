@@ -24,8 +24,10 @@ pub enum ApiError {
     /// or persistence failure). Non-409 invoice failures fail the proof-bundle
     /// submission upstream, which is the designed fail-closed behavior.
     Unavailable,
-    /// Every checkout database slot stayed busy for the whole admission
-    /// wait. Answered with `Retry-After: 1`.
+    /// A checkout database call got no slot, or no checkout pool connection
+    /// (free or newly opened), within the admission wait; or a second
+    /// expired processor replay arrived in one request. Answered with
+    /// `Retry-After: 1`.
     Busy,
 }
 

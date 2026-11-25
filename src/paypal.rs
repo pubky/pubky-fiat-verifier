@@ -81,8 +81,9 @@ pub struct Order {
     /// `PAYER_ACTION_REQUIRED`. `COMPLETED` alone is not payment — the
     /// capture object's own status must also be `COMPLETED`.
     pub status: Option<String>,
-    /// RFC 3339 creation time; a `PayPal-Request-Id` replay returns the
-    /// original order with its original value.
+    /// RFC 3339 creation time. A `PayPal-Request-Id` replay is assumed to
+    /// return the original order with its original value; that has not yet
+    /// been confirmed against the PayPal sandbox.
     #[serde(default)]
     pub create_time: Option<String>,
     #[serde(default)]

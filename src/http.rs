@@ -51,8 +51,10 @@ const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
 const SESSION_EXPIRY_SLACK_SECONDS: i64 = 60;
 /// PayPal's create-order response carries no expiry; orders are approvable
 /// for roughly three hours, so the recorded expiry mirrors that default,
-/// counted from the order's `create_time`, which a `PayPal-Request-Id`
-/// replay keeps.
+/// counted from the order's `create_time`, or from our clock when
+/// `create_time` is ahead of it (`min(create_time, now)`). A
+/// `PayPal-Request-Id` replay is assumed to keep `create_time`; that has not
+/// yet been confirmed against the PayPal sandbox.
 const PAYPAL_ORDER_TTL_SECONDS: i64 = 3 * 3600;
 const MAX_STATUS_PULL_CACHE_ENTRIES: usize = 10_000;
 

@@ -402,7 +402,8 @@ impl CorrelationStore for PostgresStore {
         session_attempt: i32,
         return_origin: Option<&str>,
     ) -> Result<bool, StoreError> {
-        // One statement keeps the origin, processor, and state guards atomic.
+        // One statement keeps the origin, processor, attempt, and state
+        // guards atomic.
         // A legacy session with NULL processor is effectively Stripe.
         let updated = sqlx::query(
             "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
@@ -1062,6 +1063,57 @@ pub mod memory {
             row(store, bundle_id).await.session_id
         }
 
+        async fn mint_for_origin(
+            store: &MemoryStore,
+            bundle_id: &str,
+            session_id: &str,
+            attempt: i32,
+            return_origin: Option<&str>,
+        ) -> bool {
+            store
+                .set_session(
+                    CREATOR,
+                    bundle_id,
+                    "stripe",
+                    session_id,
+                    "https://checkout.test/session",
+                    1000,
+                    attempt,
+                    return_origin,
+                )
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_bound_origin_refuses_writes_for_no_origin_or_another_origin() {
+            const ORIGIN_A: &str = "https://a.test";
+            const ORIGIN_B: &str = "https://b.test";
+            let store = MemoryStore::default();
+            insert(&store, "ORIGIN").await;
+            assert!(mint_for_origin(&store, "ORIGIN", "cs_a", 1, Some(ORIGIN_A)).await);
+            for attempt in [1, 2] {
+                assert!(
+                    !mint_for_origin(&store, "ORIGIN", "cs_none", attempt, None).await,
+                    "a write naming no origin applied at attempt {attempt}"
+                );
+                assert!(
+                    !mint_for_origin(&store, "ORIGIN", "cs_b", attempt, Some(ORIGIN_B)).await,
+                    "a write naming another origin applied at attempt {attempt}"
+                );
+            }
+            let bound = row(&store, "ORIGIN").await;
+            assert_eq!(bound.session_id.as_deref(), Some("cs_a"));
+            assert_eq!(bound.session_attempt, 1);
+            assert_eq!(bound.return_origin.as_deref(), Some(ORIGIN_A));
+
+            assert!(mint_for_origin(&store, "ORIGIN", "cs_a2", 2, Some(ORIGIN_A)).await);
+            let rebound = row(&store, "ORIGIN").await;
+            assert_eq!(rebound.session_id.as_deref(), Some("cs_a2"));
+            assert_eq!(rebound.session_attempt, 2);
+            assert_eq!(rebound.return_origin.as_deref(), Some(ORIGIN_A));
+        }
+
         #[tokio::test]
         async fn set_session_never_moves_the_attempt_backwards() {
             let store = MemoryStore::default();
@@ -1673,6 +1725,63 @@ pub(crate) mod postgres_tests {
             .record_webhook_event(&event_id, "charge.refunded")
             .await
             .unwrap());
+    }
+
+    async fn mint_for_origin(
+        store: &PostgresStore,
+        creator: &str,
+        session_id: &str,
+        attempt: i32,
+        return_origin: Option<&str>,
+    ) -> bool {
+        store
+            .set_session(
+                creator,
+                "ORIGIN",
+                "stripe",
+                session_id,
+                "https://checkout.test/session",
+                1000,
+                attempt,
+                return_origin,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bound_origin_refuses_writes_for_no_origin_or_another_origin() {
+        const ORIGIN_A: &str = "https://a.test";
+        const ORIGIN_B: &str = "https://b.test";
+        let Some(store) = store().await else {
+            return;
+        };
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        store.insert_new(new_row(&creator, "ORIGIN")).await.unwrap();
+        assert!(mint_for_origin(&store, &creator, "cs_a", 1, Some(ORIGIN_A)).await);
+        for attempt in [1, 2] {
+            assert!(
+                !mint_for_origin(&store, &creator, "cs_none", attempt, None).await,
+                "a write naming no origin applied at attempt {attempt}"
+            );
+            assert!(
+                !mint_for_origin(&store, &creator, "cs_b", attempt, Some(ORIGIN_B)).await,
+                "a write naming another origin applied at attempt {attempt}"
+            );
+        }
+        let bound = store.get(&creator, "ORIGIN").await.unwrap().unwrap();
+        assert_eq!(bound.session_id.as_deref(), Some("cs_a"));
+        assert_eq!(bound.session_attempt, 1);
+        assert_eq!(bound.return_origin.as_deref(), Some(ORIGIN_A));
+
+        assert!(mint_for_origin(&store, &creator, "cs_a2", 2, Some(ORIGIN_A)).await);
+        let rebound = store.get(&creator, "ORIGIN").await.unwrap().unwrap();
+        assert_eq!(rebound.session_id.as_deref(), Some("cs_a2"));
+        assert_eq!(rebound.session_attempt, 2);
+        assert_eq!(rebound.return_origin.as_deref(), Some(ORIGIN_A));
     }
 
     #[tokio::test]

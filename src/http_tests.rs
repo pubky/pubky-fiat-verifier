@@ -2143,7 +2143,9 @@ fn spawn_plain_checkout(base: &str) -> tokio::task::JoinHandle<reqwest::Response
 // mock create, guaranteeing the interleaving under test: loser read +
 // mint in flight -> winner mints and persists (binds A) -> loser's
 // fallback-URL mint persists last and is rejected by the conditional
-// UPDATE, so the loser is served the bound A session instead.
+// UPDATE, so the loser is served the bound A session instead. Both mints
+// carry the same attempt and keys that differ only by redirect URLs, so
+// only the origin guard refuses the loser.
 #[tokio::test]
 async fn stripe_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
     let harness = harness().await;
@@ -2173,25 +2175,6 @@ async fn stripe_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
     *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
     let loser = spawn_plain_checkout(&harness.base);
     wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
-
-    // Bump the stored attempt so the winner's mint carries a distinct
-    // idempotency key — with identical keys Stripe would replay one create
-    // onto the other, collapsing the two mints into one session and hiding
-    // the exact persist race under test.
-    harness
-        .store
-        .set_session(
-            CREATOR,
-            BUNDLE,
-            "stripe",
-            row.session_id.as_deref().unwrap(),
-            row.checkout_url.as_deref().unwrap(),
-            1,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
 
     // The winner mints with ORIGIN_A and persists first, binding A.
     let winner: Value = harness
@@ -2265,23 +2248,6 @@ async fn stripe_concurrent_fallback_mint_over_expired_binding_conflicts() {
     let loser = spawn_plain_checkout(&harness.base);
     wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
 
-    // Distinct idempotency key for the winner's mint (see the serve-bound
-    // race test above).
-    harness
-        .store
-        .set_session(
-            CREATOR,
-            BUNDLE,
-            "stripe",
-            row.session_id.as_deref().unwrap(),
-            row.checkout_url.as_deref().unwrap(),
-            1,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
-
     let winner: Value = harness
         .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
         .await
@@ -2300,7 +2266,7 @@ async fn stripe_concurrent_fallback_mint_over_expired_binding_conflicts() {
                 "cs_test_2",
                 winner["checkout_url"].as_str().unwrap(),
                 1,
-                3,
+                2,
                 Some(ORIGIN_A),
             )
             .await
@@ -2350,23 +2316,6 @@ async fn paypal_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
     *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
     let loser = spawn_plain_checkout(&harness.base);
     wait_for_create_calls(&harness.paypal_mock.create_calls, 2).await;
-
-    // Distinct idempotency key for the winner's mint (see the Stripe race
-    // test above).
-    harness
-        .store
-        .set_session(
-            CREATOR,
-            BUNDLE,
-            "paypal",
-            row.session_id.as_deref().unwrap(),
-            row.checkout_url.as_deref().unwrap(),
-            1,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
 
     let winner: Value = harness
         .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
