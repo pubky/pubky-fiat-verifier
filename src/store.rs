@@ -116,7 +116,13 @@ pub trait CorrelationStore: Send + Sync {
     /// effectively Stripe. Thus the first persisted processor wins, while a
     /// same-processor re-mint remains valid. An attempt older than the
     /// stored `session_attempt` never applies, so a late persist cannot
-    /// replace a newer session. Returns `false` when any guard
+    /// replace a newer session. At an equal attempt the write applies only
+    /// when the row holds no session or the same `session_id`: two mints
+    /// with different redirect URLs share an attempt under distinct keys,
+    /// and the first to persist wins, so a session already served is never
+    /// replaced by its concurrent sibling. A row whose attempt was skipped
+    /// still holds its earlier session and refuses every other session at
+    /// that attempt. Returns `false` when any guard
     /// rejects the write; the caller must not serve the session it minted.
     #[allow(clippy::too_many_arguments)]
     async fn set_session(
@@ -402,15 +408,16 @@ impl CorrelationStore for PostgresStore {
         session_attempt: i32,
         return_origin: Option<&str>,
     ) -> Result<bool, StoreError> {
-        // One statement keeps the origin, processor, attempt, and state
-        // guards atomic.
+        // One statement keeps the origin, processor, attempt, session, and
+        // state guards atomic.
         // A legacy session with NULL processor is effectively Stripe.
         let updated = sqlx::query(
             "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
              checkout_expires_at = $6, session_attempt = $7, \
              return_origin = COALESCE($8, return_origin), updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2 AND state = 'created' \
-             AND session_attempt <= $7 \
+             AND (session_attempt < $7 \
+                  OR (session_attempt = $7 AND (session_id IS NULL OR session_id = $4))) \
              AND (return_origin IS NULL OR return_origin = $8) \
              AND ((processor IS NULL AND session_id IS NULL) \
                   OR COALESCE(processor, CASE WHEN session_id IS NOT NULL THEN 'stripe' END) = $3)",
@@ -705,6 +712,14 @@ pub mod memory {
                 return false;
             }
             if session_attempt < row.session_attempt {
+                return false;
+            }
+            if session_attempt == row.session_attempt
+                && row
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|held| held != session_id)
+            {
                 return false;
             }
             // Same origin guard as the SQL predicate: apply only while the
@@ -1123,8 +1138,47 @@ pub mod memory {
             let row = row(&store, "BACK").await;
             assert_eq!(row.session_id.as_deref(), Some("cs_new"));
             assert_eq!(row.session_attempt, 2);
-            assert!(mint(&store, "BACK", "stripe", "cs_same", 2).await);
-            assert_eq!(row_id(&store, "BACK").await, Some("cs_same".to_owned()));
+            assert!(mint(&store, "BACK", "stripe", "cs_new", 2).await);
+            assert_eq!(row_id(&store, "BACK").await, Some("cs_new".to_owned()));
+        }
+
+        #[tokio::test]
+        async fn an_equal_attempt_never_replaces_a_different_session() {
+            let store = MemoryStore::default();
+            insert(&store, "EQUAL").await;
+            assert!(mint(&store, "EQUAL", "stripe", "cs_first", 2).await);
+            assert!(
+                !mint(&store, "EQUAL", "stripe", "cs_second", 2).await,
+                "a second session at the same attempt applied"
+            );
+            assert!(
+                !mint_for_origin(&store, "EQUAL", "cs_origin", 2, Some("https://a.test")).await,
+                "an origin-bound session at the same attempt applied"
+            );
+            let held = row(&store, "EQUAL").await;
+            assert_eq!(held.session_id.as_deref(), Some("cs_first"));
+            assert_eq!(held.return_origin, None);
+            assert!(mint(&store, "EQUAL", "stripe", "cs_first", 2).await);
+
+            insert(&store, "SKIPPED").await;
+            store
+                .skip_session_attempt(CREATOR, "SKIPPED", 2)
+                .await
+                .unwrap();
+            assert!(mint(&store, "SKIPPED", "stripe", "cs_after_skip", 2).await);
+
+            insert(&store, "HELD").await;
+            assert!(mint(&store, "HELD", "stripe", "cs_held", 1).await);
+            store
+                .skip_session_attempt(CREATOR, "HELD", 2)
+                .await
+                .unwrap();
+            assert!(
+                !mint(&store, "HELD", "stripe", "cs_skipped", 2).await,
+                "a session at a skipped attempt replaced the held session"
+            );
+            assert_eq!(row_id(&store, "HELD").await, Some("cs_held".to_owned()));
+            assert!(mint(&store, "HELD", "stripe", "cs_next", 3).await);
         }
 
         #[tokio::test]
@@ -1808,5 +1862,72 @@ pub(crate) mod postgres_tests {
             mint(&store, &creator, "BACK", "stripe", "cs_new", 2).await,
             "re-persisting the same attempt stays allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn an_equal_attempt_never_replaces_a_different_session() {
+        let Some(store) = store().await else {
+            return;
+        };
+        let creator = format!(
+            "pubkytest{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        for bundle in ["EQUAL", "SKIPPED", "HELD"] {
+            store.insert_new(new_row(&creator, bundle)).await.unwrap();
+        }
+        assert!(mint(&store, &creator, "EQUAL", "stripe", "cs_first", 2).await);
+        assert!(
+            !mint(&store, &creator, "EQUAL", "stripe", "cs_second", 2).await,
+            "a second session at the same attempt applied"
+        );
+        let origin_write = store
+            .set_session(
+                &creator,
+                "EQUAL",
+                "stripe",
+                "cs_origin",
+                "https://checkout.test/session",
+                1000,
+                2,
+                Some("https://a.test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !origin_write,
+            "an origin-bound session at the same attempt applied"
+        );
+        let held = store.get(&creator, "EQUAL").await.unwrap().unwrap();
+        assert_eq!(held.session_id.as_deref(), Some("cs_first"));
+        assert_eq!(held.return_origin, None);
+        assert!(mint(&store, &creator, "EQUAL", "stripe", "cs_first", 2).await);
+
+        store
+            .skip_session_attempt(&creator, "SKIPPED", 2)
+            .await
+            .unwrap();
+        assert!(mint(&store, &creator, "SKIPPED", "stripe", "cs_after_skip", 2).await);
+
+        assert!(mint(&store, &creator, "HELD", "stripe", "cs_held", 1).await);
+        store
+            .skip_session_attempt(&creator, "HELD", 2)
+            .await
+            .unwrap();
+        assert!(
+            !mint(&store, &creator, "HELD", "stripe", "cs_skipped", 2).await,
+            "a session at a skipped attempt replaced the held session"
+        );
+        assert_eq!(
+            store
+                .get(&creator, "HELD")
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("cs_held")
+        );
+        assert!(mint(&store, &creator, "HELD", "stripe", "cs_next", 3).await);
     }
 }

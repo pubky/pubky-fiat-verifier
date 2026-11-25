@@ -2145,7 +2145,8 @@ fn spawn_plain_checkout(base: &str) -> tokio::task::JoinHandle<reqwest::Response
 // fallback-URL mint persists last and is rejected by the conditional
 // UPDATE, so the loser is served the bound A session instead. Both mints
 // carry the same attempt and keys that differ only by redirect URLs, so
-// only the origin guard refuses the loser.
+// the origin guard and the equal-attempt session guard each refuse the
+// loser.
 #[tokio::test]
 async fn stripe_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
     let harness = harness().await;
@@ -4602,4 +4603,180 @@ async fn checkout_persists_skips_and_re_reads_only_on_the_checkout_store() {
     assert_eq!(slow["checkout_url"], winner["checkout_url"]);
     assert_eq!(checkout.take(), vec!["set_session", "get"]);
     assert_eq!(main.take(), Vec::<&str>::new());
+}
+
+/// Fires an origin-A checkout request in the background: it parks on the
+/// mock's create gate after reading the row.
+fn spawn_origin_checkout(base: &str) -> tokio::task::JoinHandle<reqwest::Response> {
+    let url = format!("{base}/checkout-sessions");
+    tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE, "return_origin": ORIGIN_A}))
+            .send()
+            .await
+            .unwrap()
+    })
+}
+
+/// Expires the eager attempt-1 session so the next checkouts re-mint at
+/// attempt 2 while the row has no bound origin.
+async fn expire_eager_session(harness: &Harness, processor: &str) {
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert!(harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            processor,
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap());
+}
+
+// Regression: an origin-A mint that read the row before a concurrent
+// no-origin mint persisted shares attempt 2 under a distinct key (the key
+// covers the redirect URLs). The no-origin buyer is served first; the
+// origin-A persist at the same attempt must lose instead of replacing the
+// served session, and the origin-A buyer is served the live winner.
+#[tokio::test]
+async fn stripe_equal_attempt_persist_never_replaces_a_served_session() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    expire_eager_session(&harness, "stripe").await;
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let origin_buyer = spawn_origin_checkout(&harness.base);
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
+
+    let plain = harness.checkout(BUNDLE, None).await;
+    assert_eq!(plain.status().as_u16(), 200);
+    let plain: Value = plain.json().await.unwrap();
+    assert_eq!(
+        plain["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+
+    release.send(()).unwrap();
+    let origin_response = origin_buyer.await.unwrap();
+    assert_eq!(origin_response.status().as_u16(), 200);
+    let origin_body: Value = origin_response.json().await.unwrap();
+    assert_eq!(origin_body["checkout_url"], plain["checkout_url"]);
+
+    // The origin-A mint really happened, with A-derived URLs, and was
+    // never persisted or served.
+    let creates = harness.stripe_mock.creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 3);
+    assert!(
+        creates[2]
+            .1
+            .contains("success_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dreturn"),
+        "form was: {}",
+        creates[2].1
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("cs_test_2"));
+    assert_eq!(row.session_attempt, 2);
+    assert_eq!(row.return_origin, None);
+}
+
+// Same interleaving on the PayPal leg: the served order is never replaced
+// by the origin-A order minted at the same attempt.
+#[tokio::test]
+async fn paypal_equal_attempt_persist_never_replaces_a_served_order() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    expire_eager_session(&harness, "paypal").await;
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+    let origin_buyer = spawn_origin_checkout(&harness.base);
+    wait_for_create_calls(&harness.paypal_mock.create_calls, 2).await;
+
+    let plain = harness.checkout(BUNDLE, None).await;
+    assert_eq!(plain.status().as_u16(), 200);
+    let plain: Value = plain.json().await.unwrap();
+    assert_eq!(
+        plain["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+
+    release.send(()).unwrap();
+    let origin_response = origin_buyer.await.unwrap();
+    assert_eq!(origin_response.status().as_u16(), 200);
+    let origin_body: Value = origin_response.json().await.unwrap();
+    assert_eq!(origin_body["checkout_url"], plain["checkout_url"]);
+
+    let origin_mint: Value =
+        serde_json::from_str(&harness.paypal_mock.creates.lock().unwrap()[2].1).unwrap();
+    assert_eq!(
+        origin_mint["payment_source"]["paypal"]["experience_context"]["return_url"],
+        format!("{ORIGIN_A}/marketplace?checkout=return")
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+    assert_eq!(row.session_attempt, 2);
+    assert_eq!(row.return_origin, None);
+}
+
+// Two concurrent no-origin checkouts at the same attempt share one key, so
+// the processor returns one session to both. The second persist names the
+// same session and still applies; both buyers get it.
+#[tokio::test]
+async fn same_key_concurrent_replay_persists_idempotently() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    expire_eager_session(&harness, "stripe").await;
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let parked = spawn_plain_checkout(&harness.base);
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
+
+    let first = harness.checkout(BUNDLE, None).await;
+    assert_eq!(first.status().as_u16(), 200);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(
+        first["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+
+    // Expire the persisted copy so only an applied re-persist (fresh
+    // expiry) lets the replaying request serve the session itself.
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    let live_expiry = row.checkout_expires_at.unwrap();
+    assert!(harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "stripe",
+            "cs_test_2",
+            first["checkout_url"].as_str().unwrap(),
+            1,
+            2,
+            None,
+        )
+        .await
+        .unwrap());
+
+    release.send(()).unwrap();
+    let replay = parked.await.unwrap();
+    assert_eq!(replay.status().as_u16(), 200);
+    let replay: Value = replay.json().await.unwrap();
+    assert_eq!(replay["checkout_url"], first["checkout_url"]);
+
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 2);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("cs_test_2"));
+    assert_eq!(row.session_attempt, 2);
+    assert_eq!(row.checkout_expires_at, Some(live_expiry));
 }

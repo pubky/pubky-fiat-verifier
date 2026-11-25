@@ -732,8 +732,8 @@ async fn create_processor_session(
 
 /// The conditional persist of a just-minted session lost the race: between
 /// the pre-mint read and the UPDATE, a concurrent mint bound the correlation
-/// to a different return origin or processor, persisted a newer attempt,
-/// or the row left `created`.
+/// to a different return origin or processor, persisted a newer attempt or
+/// another session at the same attempt, or the row left `created`.
 /// The session we minted is never served over that persisted state; re-read
 /// the winner instead. When the winning session is still live it is served,
 /// because the store guards keep its processor and derived redirect URLs
