@@ -298,11 +298,14 @@ impl PostgresStore {
             .await
             .map_err(db_err)?;
         sqlx::raw_sql(SCHEMA).execute(&main).await.map_err(db_err)?;
+        // Lazy so opening the pool does not run TCP/TLS under
+        // `acquire_timeout`. The main pool already reached Postgres and
+        // applied the schema; checkout connections open on first use, where
+        // `acquire_timeout` bounds the wait as `FIAT_CHECKOUT_LOOKUP_WAIT_MS`.
         let checkout = sqlx::postgres::PgPoolOptions::new()
             .max_connections(checkout.connections)
             .acquire_timeout(checkout.acquire_timeout)
-            .connect(database_url)
-            .await
+            .connect_lazy(database_url)
             .map_err(db_err)?;
         Ok(PostgresStores {
             main: Self { pool: main },
@@ -1325,9 +1328,8 @@ pub(crate) mod postgres_tests {
     /// Postgres, so the tests bootstrap the schema one at a time.
     static BOOTSTRAP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// The acquire timeout also bounds opening a connection (sqlx-core
-    /// 0.8.6 `pool/inner.rs`), so it leaves room for connection setup on a
-    /// loaded machine. Tests that assert a pool timeout use `stores_with`.
+    /// The acquire timeout bounds runtime pool acquisition on a loaded
+    /// machine. Tests that assert a pool timeout use `stores_with`.
     pub(crate) const TEST_CHECKOUT_POOL: CheckoutPool = CheckoutPool {
         connections: 4,
         acquire_timeout: Duration::from_secs(10),
@@ -1435,6 +1437,58 @@ pub(crate) mod postgres_tests {
 
     fn assert_unchanged(before: &Correlation, after: &Correlation) {
         assert_eq!(format!("{before:?}"), format!("{after:?}"));
+    }
+
+    #[tokio::test]
+    async fn checkout_pool_lazy_connect_survives_a_short_acquire_budget() {
+        let Some(url) = std::env::var("FIAT_TEST_DATABASE_URL").ok() else {
+            eprintln!("FIAT_TEST_DATABASE_URL unset: skipping the Postgres store test");
+            return;
+        };
+        let _bootstrap = BOOTSTRAP.lock().await;
+        let checkout = CheckoutPool {
+            connections: 2,
+            acquire_timeout: Duration::from_millis(1),
+        };
+        let stores = PostgresStore::connect(&url, checkout)
+            .await
+            .expect("lazy checkout pool must not open checkout TCP at boot");
+        assert_eq!(stores.checkout.pool().size(), 0);
+    }
+
+    #[tokio::test]
+    async fn checkout_pool_acquire_waits_then_times_out_at_runtime() {
+        let Some(stores) = stores_with(CheckoutPool {
+            connections: 1,
+            acquire_timeout: Duration::from_millis(250),
+        })
+        .await
+        else {
+            return;
+        };
+        let held = stores
+            .checkout
+            .pool()
+            .acquire()
+            .await
+            .expect("first checkout acquire succeeds");
+        let started = std::time::Instant::now();
+        let second =
+            tokio::time::timeout(Duration::from_secs(2), stores.checkout.pool().acquire()).await;
+        assert!(
+            matches!(second, Ok(Err(sqlx::Error::PoolTimedOut)),),
+            "second acquire must time out"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "waited only {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "acquire must not exceed the test harness timeout"
+        );
+        drop(held);
     }
 
     #[tokio::test]
