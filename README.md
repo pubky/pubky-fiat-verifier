@@ -55,7 +55,7 @@ not a second backend: one URL, all rails. Cutover is an operator env change
 | --- | --- | --- |
 | `POST /invoices` | `X-Paykit-Signature` (pinned Lock Server key; canonical-JSON strict body) | Fetch the content lock from the creator's homeserver (public Pubky read), parse the `paykit-payment` criterion, dispatch by `asset`. BTC → proxy. Fiat → persist correlation, `204`; a hosted checkout is minted eagerly when exactly one processor is configured (see processor selection below). Exact replay → `204` (idempotent). Same identity, different binding → `409`. |
 | `POST /transactions/status` | same | Unknown or BTC correlation → proxy (the real Paykit Server owns every BTC invoice, including all pre-cutover ones). Fiat → answered from local state, advanced **only** by verified API pulls. |
-| `POST /checkout-sessions` | possession of `{creator, bundle_id}` (bearer material), rate-limited | Body `{creator, bundle_id, processor?, return_origin?}`. Returns `{checkout_url, processor, expires_at}`. Idempotent; re-mints on the **same** processor if the session expired. `404` unknown/BTC, `409` once paid, when `processor` names a different processor than the correlation is bound to, or when `return_origin` differs from the bound origin, `400` unknown processor value (`invalid_request`) or an origin off the allowlist (`invalid_return_origin`), `503` when the named processor is not configured. |
+| `POST /checkout-sessions` | possession of `{creator, bundle_id}` (bearer material), rate-limited | Body `{creator, bundle_id, processor?, return_origin?}`. Returns `{checkout_url, processor, expires_at}`. Idempotent; re-mints on the **same** processor if the session expired. `404` unknown/BTC, `409` once paid, when `processor` names a different processor than the correlation is bound to, or when `return_origin` differs from the bound origin, `400` unknown processor value (`invalid_request`) or an origin off the allowlist (`invalid_return_origin`), `503` when the named processor is not configured or its create response lacks the checkout URL or expiry (Stripe `url` or `expires_at`, PayPal approval link or `create_time`), `503` `busy` with `Retry-After: 1` when a checkout database call gets no slot, or no checkout pool connection, within `FIAT_CHECKOUT_LOOKUP_WAIT_MS`, or when a second expired processor replay arrives in one request, `429` when a mint finds the checkout rate budget empty. |
 | `POST /webhooks/stripe` | `Stripe-Signature` (HMAC over raw body, ±300s tolerance, deduped by event id) | A **hint, never a fact**: schedules an API pull. `checkout.session.completed` / `async_payment_succeeded` → pull the session. `charge.refunded` (object = the charge) / `charge.dispute.created` (object = the dispute, whose `charge` is pulled) → pull the charge, and only a corroborating pull marks the correlation reversed, in any state including `confirmed`. A transient failure (processor or database unavailable) answers `503` and releases the event id, so Stripe's retry is processed instead of deduplicated. |
 | `POST /webhooks/paypal` | PayPal transmission headers, verified via `POST /v1/notifications/verify-webhook-signature` over the exact raw body (requires `PAYPAL_WEBHOOK_ID`); deduped by event id | Same hint-only and transient-failure rules. `CHECKOUT.ORDER.APPROVED` / `CHECKOUT.ORDER.COMPLETED` / `PAYMENT.CAPTURE.COMPLETED` / `PENDING` → pull the order. `PAYMENT.CAPTURE.REFUNDED` / `REVERSED` / `DENIED` → pull the capture; `CUSTOMER.DISPUTE.CREATED` → pull the dispute (`GET /v1/customer/disputes/{id}`); only a corroborating pull marks the correlation reversed. |
 | `GET /health` | none | DB + processor wiring status (`stripe_enabled`, `stripe_webhook_configured`, `paypal_enabled`, `paypal_webhook_configured`, `default_processor`). |
@@ -70,10 +70,12 @@ not a second backend: one URL, all rails. Cutover is an operator env change
   (default `stripe`).
 - **The binding is permanent.** Once a session/order is minted, the correlation's
   processor never changes — a later `/checkout-sessions` naming the other processor
-  gets `409`. Reason, stated honestly: switching would leave a still-payable
-  session on the abandoned processor whose payment this gateway would no longer
-  observe; refusing the switch is the fail-closed option. Expired sessions re-mint
-  on the same processor.
+  gets `409`. Of two concurrent first checkouts naming different processors, the
+  first persisted session wins; the other request is answered with that live
+  session (which names the winning processor) or `409`. Reason, stated honestly:
+  switching would leave a still-payable session on the abandoned processor whose
+  payment this gateway would no longer observe; refusing the switch is the
+  fail-closed option. Expired sessions re-mint on the same processor.
 
 ### The PayPal order lifecycle
 
@@ -85,7 +87,12 @@ not landed), the verifier captures explicitly — capture-on-approval either way
 Payment is only ever recognized from a pull showing order `COMPLETED` **and** a
 capture whose own status is `COMPLETED` with the criterion's exact amount and
 currency. The recorded session expiry is 3 hours (PayPal's default order
-validity; the create response carries no expiry field).
+validity; the create response carries no expiry field), counted from the
+order's `create_time`, or from the verifier's clock when `create_time` is
+ahead of it. A `PayPal-Request-Id` replay is treated as returning the original
+order with its original `create_time`; this has not yet been confirmed against
+the PayPal sandbox. An order without a readable `create_time` is not recorded
+(`503`).
 
 ### Fiat state mapping (settlement delay = fiat confirmations)
 
@@ -93,9 +100,11 @@ validity; the create response carries no expiry field).
 | --- | --- |
 | created (no completed checkout) | `undetected, 0, false` |
 | paid (API pull verified), inside settlement delay | `detected, 0, amount_matched` |
-| paid, delay elapsed, fresh re-pull still paid and not refunded or disputed | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
-| confirmed, fresh re-pull on every status read still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
-| confirmed, processor unreadable on that read | `detected, 0, true` (held, never served blind) |
+| paid, delay elapsed, fresh re-pull still paid and not refunded or disputed, and the row still `paid` when the promotion is written | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| paid, delay elapsed, but the status-pull budget is empty | `detected, 0, amount_matched` (promotion waits for a later status pull, or for the poll worker if the row is among the 200 oldest open rows it reads per tick) |
+| confirmed, pull within the freshness window still clean | `confirmed, FIAT_SYNTHESIZED_CONFIRMATIONS, true` |
+| confirmed, processor unreadable or not configured, or the status-pull budget is empty | `detected, 0, true` (held, never served blind) |
+| created, status-pull budget empty | `undetected, 0, false` (the pull is skipped; a webhook, a later status pull, or the poll worker can still detect payment, the worker only if the row is among the 200 oldest open rows it reads per tick) |
 | reversed — refunded (fully or partially) or disputed, pull-verified, before or after confirmation | `undetected, 0, false` |
 
 **What "paid" means.** A Stripe Checkout Session keeps `payment_status: paid` after a
@@ -158,7 +167,7 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_PAYKIT_SERVER_URL` | no | `http://paykit-server.railway.internal:3001` | The real Paykit Server for BTC pass-through. |
 | `FIAT_LISTEN_ADDR` / `PORT` | no | `[::]:3002` | Bind address (Railway injects `PORT`). |
 | `STRIPE_SECRET_KEY` | no | — | **Test-mode** secret key (`sk_test_...`). Absent ⇒ the Stripe path fails closed with 503; BTC proxying is unaffected. |
-| `STRIPE_WEBHOOK_SECRET` | no | — | Webhook signing secret (`whsec_...`). Absent ⇒ webhooks answer 503 and detection relies purely on API polling (the Lock Server's ~30s status poll and the slow poll both pull). |
+| `STRIPE_WEBHOOK_SECRET` | no | — | Webhook signing secret (`whsec_...`). Absent ⇒ webhooks answer 503 and detection relies purely on API polling (the Lock Server's ~30s status poll pulls, and the slow poll pulls the 200 oldest open rows per tick). |
 | `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` | no | — | **Sandbox** REST app credentials, set together. Absent ⇒ the PayPal path fails closed with 503. |
 | `PAYPAL_WEBHOOK_ID` | no | — | Webhook id (`WH-...`) from the PayPal developer dashboard, required by the verification postback. Absent ⇒ PayPal webhooks answer 503 and detection relies purely on API polling. |
 | `PAYPAL_API_BASE` | no | `https://api-m.sandbox.paypal.com` | A non-sandbox host refuses to boot without `FIAT_LIVE_MODE=true`. |
@@ -169,11 +178,20 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_ALLOWED_ASSETS` | no | `USD` | Comma-separated uppercase fiat codes accepted on the fiat path (never BTC). |
 | `BUYER_RETURN_ORIGINS` | no | empty | Comma-separated exact `https://` origins (scheme+host[+port] only — no path/query/fragment/userinfo; any invalid entry refuses to boot). Multi-shop mode: a `/checkout-sessions` request may name one as `return_origin`, and the success/cancel redirect URLs are then derived server-side as `{origin}/marketplace?checkout=return` and `{origin}/marketplace?checkout=cancel`. The origin is bound to the correlation at mint and never changes. |
 | `FIAT_CHECKOUT_SUCCESS_URL` / `FIAT_CHECKOUT_CANCEL_URL` | no | staging app URLs | **Legacy single-shop mode**: static redirect targets used when a checkout request carries no `return_origin` (or the allowlist is empty). Redirects are buyer-attested and carry no state; the Locks lifecycle is the only truth. |
-| `FIAT_POLL_INTERVAL_SECONDS` | no | `60` | Slow-poll interval over open fiat correlations (lost-webhook recovery). |
+| `FIAT_POLL_INTERVAL_SECONDS` | no | `60` | Slow-poll interval over the 200 oldest open fiat correlations (lost-webhook recovery). |
 | `FIAT_REVERSAL_WATCH_DAYS` | no | `180` | How long after confirmation the poll worker keeps re-checking for a refund or dispute (1–3650). The default covers PayPal's 180-day dispute window; Stripe card disputes arrive within 120 days. |
 | `FIAT_REVERSAL_RECHECK_SECONDS` | no | `3600` | Minimum time between two reversal checks of one confirmed payment. Each Stripe check costs two API reads (session and PaymentIntent), each PayPal check two (order and disputes). |
-| `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket for `/checkout-sessions`. |
+| `FIAT_CHECKOUT_LOOKUP_CONCURRENCY` | no | `4` | How many `/checkout-sessions` database calls (the correlation lookup, the session persist, the re-read after a lost persist race, and the skip of an expired replayed attempt) run at once, and the size of the checkout pool they run on. Each replica opens up to 10 Postgres connections: up to this many form the checkout pool, and up to 10 minus this many form the main pool that status polls, invoices, webhooks and the poll worker use. Checkout never runs on the main pool, so a connection SQLx is still returning after a checkout call counts against the checkout pool only. Each call holds its slot only while it runs, never during a processor call. `GET /health` runs its `SELECT 1` on the main pool outside this limit. Must be at least 1 and below `10`, or the service refuses to boot. At runtime, opening a checkout pool connection counts against `FIAT_CHECKOUT_LOOKUP_WAIT_MS`, so after idle connections close a slow Postgres connect can answer `busy`. The checkout pool is created lazily at boot and does not open checkout connections until the first checkout call. Malformed bodies and rejected processors or origins never take a slot. |
+| `FIAT_CHECKOUT_LOOKUP_WAIT_MS` | no | `2000` | How long a checkout database call waits for a slot, in arrival order, and then for a checkout pool connection. When either wait runs out the request gets 503 with `Retry-After: 1` and that call is never made. A checkout makes up to four such calls (the lookup, the skip of an expired replayed attempt, the persist, the re-read after a lost persist race), each with its own waits. If the processor session was already created, the row keeps its attempt number, so a retry with the same return origin, within the processor's idempotency window, gets the same processor session back. The idempotency key covers the redirect URLs, so a retry from another allowed origin (while the row has none bound) mints its own session; the earlier one was never served. A replayed session that has already expired is never served: its attempt is recorded as skipped and the next attempt is minted. A persist never replaces a session of a newer attempt; the request whose persist loses is served the newer session while it is live, and `409` otherwise. Must be between 1 and 10000. |
+| `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket charged only when `/checkout-sessions` mints a session; rejected bodies, lookups that end in 404 or 409, and live-session reuse spend nothing. |
+| `FIAT_STATUS_PULL_FRESHNESS_SECONDS` | no | `15` | How long status polls may reuse a paid or unpaid processor observation for the same session, counted from when the pull started. `0` disables reuse; values above `60` refuse to boot, since the window bounds how old the observation behind a `confirmed` answer can be. |
+| `FIAT_STATUS_PULL_RATE_PER_SECOND` / `FIAT_STATUS_PULL_RATE_BURST` | no | `10` / `50` | Outbound token bucket shared by real processor pulls from status requests. Cache hits, webhook corroboration pulls, and poll-worker pulls spend nothing. Both values must be positive (`0` refuses to boot). |
+| `FIAT_SETTLEMENT_PULL_RATE_PER_SECOND` / `FIAT_SETTLEMENT_PULL_RATE_BURST` | no | `5` / `20` | Outbound token bucket reserved for status pulls that re-check a confirmed payment or promote a paid one; those fall back to the shared bucket once this one is empty. Polls of unpaid checkouts never draw from it, so open unpaid sessions cannot starve settlement. A pull refused for budget logs a warning at most once a minute, with refusal counts. Both values must be positive. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
+
+The status cache, the three buckets and the checkout slots live in process memory: each replica keeps its own, so the outbound pull rate scales with the replica count, and so does the number of connections checkout can hold across replicas (each replica has its own pools). With an empty budget, polls of unpaid checkouts skip the pull and promotion waits; neither ever advances state without a pull. A status request for a row bound to a processor this deployment does not configure makes no pull and spends no pull budget: the row holds its reported state (`confirmed` is held at `detected`), and a disabled rail cannot hold the enabled rail's payments at `detected`.
+
+The poll worker reads at most the 200 oldest open (`created` or `paid`) rows per tick, so it is a fallback only for those rows. Newer rows rely on webhooks and on status pulls when more than 200 rows are open.
 
 ## Runbook
 

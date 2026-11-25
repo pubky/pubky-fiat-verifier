@@ -81,6 +81,11 @@ pub struct Order {
     /// `PAYER_ACTION_REQUIRED`. `COMPLETED` alone is not payment — the
     /// capture object's own status must also be `COMPLETED`.
     pub status: Option<String>,
+    /// RFC 3339 creation time. A `PayPal-Request-Id` replay is assumed to
+    /// return the original order with its original value; that has not yet
+    /// been confirmed against the PayPal sandbox.
+    #[serde(default)]
+    pub create_time: Option<String>,
     #[serde(default)]
     pub links: Vec<Link>,
     #[serde(default)]
@@ -88,6 +93,13 @@ pub struct Order {
 }
 
 impl Order {
+    pub fn created_at_unix(&self) -> Option<i64> {
+        let create_time = self.create_time.as_deref()?;
+        OffsetDateTime::parse(create_time, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(OffsetDateTime::unix_timestamp)
+    }
+
     /// The buyer's hosted approval URL: `payer-action` (payment_source
     /// integrations) with `approve` as the legacy fallback.
     pub fn approval_url(&self) -> Option<&str> {
@@ -450,6 +462,25 @@ pub fn decimal_to_minor(asset: &str, value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_order_creation_time() {
+        use serde_json::{json, Value};
+        let order = |create_time: Value| -> Order {
+            serde_json::from_value(json!({
+                "id": "ORDER1",
+                "status": "CREATED",
+                "create_time": create_time,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            order(json!("2026-11-24T10:00:00Z")).created_at_unix(),
+            Some(1_795_514_400)
+        );
+        assert_eq!(order(json!("yesterday")).created_at_unix(), None);
+        assert_eq!(order(Value::Null).created_at_unix(), None);
+    }
 
     #[test]
     fn converts_minor_units_to_paypal_decimal() {

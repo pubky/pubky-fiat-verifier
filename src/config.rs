@@ -92,9 +92,25 @@ pub struct Config {
     /// Max content-lock document size fetched from a homeserver.
     pub lock_resource_max_bytes: u64,
     pub lock_fetch_timeout: Duration,
-    /// Requests-per-second budget for the buyer-facing /checkout-sessions.
+    /// Store calls /checkout-sessions may run at once, and the size of the
+    /// checkout pool they run on; below `STORE_POOL_SIZE`, whose remainder
+    /// is the main pool that status, webhook and invoice work use.
+    pub checkout_lookup_concurrency: usize,
+    /// How long a checkout store call waits for a slot, and then for a
+    /// checkout pool connection, before answering 503.
+    pub checkout_lookup_wait: Duration,
+    /// Session-mint budget for the buyer-facing /checkout-sessions.
     pub checkout_rate_per_second: u64,
     pub checkout_rate_burst: u64,
+    /// How long a status request may reuse a processor observation.
+    pub status_pull_freshness: Duration,
+    /// Outbound processor-pull budget shared by status requests.
+    pub status_pull_rate_per_second: u64,
+    pub status_pull_rate_burst: u64,
+    /// Outbound pull budget reserved for status requests that re-check a
+    /// confirmed payment or promote a paid one.
+    pub settlement_pull_rate_per_second: u64,
+    pub settlement_pull_rate_burst: u64,
 }
 
 impl Config {
@@ -272,8 +288,36 @@ impl Config {
                 "FIAT_LOCK_FETCH_TIMEOUT_SECONDS",
                 10,
             )?),
+            checkout_lookup_concurrency: checkout_lookup_concurrency(parse_u64(
+                "FIAT_CHECKOUT_LOOKUP_CONCURRENCY",
+                4,
+            )?)?,
+            checkout_lookup_wait: checkout_lookup_wait(parse_u64(
+                "FIAT_CHECKOUT_LOOKUP_WAIT_MS",
+                2000,
+            )?)?,
             checkout_rate_per_second: parse_u64("FIAT_CHECKOUT_RATE_PER_SECOND", 5)?,
             checkout_rate_burst: parse_u64("FIAT_CHECKOUT_RATE_BURST", 20)?,
+            status_pull_freshness: status_pull_freshness(parse_u64(
+                "FIAT_STATUS_PULL_FRESHNESS_SECONDS",
+                15,
+            )?)?,
+            status_pull_rate_per_second: positive(
+                "FIAT_STATUS_PULL_RATE_PER_SECOND",
+                parse_u64("FIAT_STATUS_PULL_RATE_PER_SECOND", 10)?,
+            )?,
+            status_pull_rate_burst: positive(
+                "FIAT_STATUS_PULL_RATE_BURST",
+                parse_u64("FIAT_STATUS_PULL_RATE_BURST", 50)?,
+            )?,
+            settlement_pull_rate_per_second: positive(
+                "FIAT_SETTLEMENT_PULL_RATE_PER_SECOND",
+                parse_u64("FIAT_SETTLEMENT_PULL_RATE_PER_SECOND", 5)?,
+            )?,
+            settlement_pull_rate_burst: positive(
+                "FIAT_SETTLEMENT_PULL_RATE_BURST",
+                parse_u64("FIAT_SETTLEMENT_PULL_RATE_BURST", 20)?,
+            )?,
         })
     }
 }
@@ -341,6 +385,54 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
         .ok_or(ConfigError::Missing(name))
 }
 
+/// Longest time a status request may reuse a processor observation: it
+/// bounds how stale the observation behind a `confirmed` answer can be.
+pub const MAX_STATUS_PULL_FRESHNESS_SECONDS: u64 = 60;
+
+fn status_pull_freshness(seconds: u64) -> Result<Duration, ConfigError> {
+    if seconds > MAX_STATUS_PULL_FRESHNESS_SECONDS {
+        return Err(ConfigError::Invalid(
+            "FIAT_STATUS_PULL_FRESHNESS_SECONDS",
+            format!("must be at most {MAX_STATUS_PULL_FRESHNESS_SECONDS}"),
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// At least one slot, and fewer than the store pool holds.
+fn checkout_lookup_concurrency(value: u64) -> Result<usize, ConfigError> {
+    let pool = u64::from(crate::store::STORE_POOL_SIZE);
+    if value == 0 || value >= pool {
+        return Err(ConfigError::Invalid(
+            "FIAT_CHECKOUT_LOOKUP_CONCURRENCY",
+            format!("must be at least 1 and below the store connection budget ({pool})"),
+        ));
+    }
+    usize::try_from(value)
+        .map_err(|_| ConfigError::Invalid("FIAT_CHECKOUT_LOOKUP_CONCURRENCY", "too large".into()))
+}
+
+pub const MAX_CHECKOUT_LOOKUP_WAIT_MS: u64 = 10_000;
+
+fn checkout_lookup_wait(millis: u64) -> Result<Duration, ConfigError> {
+    if millis == 0 || millis > MAX_CHECKOUT_LOOKUP_WAIT_MS {
+        return Err(ConfigError::Invalid(
+            "FIAT_CHECKOUT_LOOKUP_WAIT_MS",
+            format!("must be between 1 and {MAX_CHECKOUT_LOOKUP_WAIT_MS}"),
+        ));
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+/// A zero pull rate or burst would silently stop status pulls, and with them
+/// every `confirmed` answer.
+fn positive(name: &'static str, value: u64) -> Result<u64, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(name, "must be positive".to_owned()));
+    }
+    Ok(value)
+}
+
 fn parse_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     match std::env::var(name) {
         Ok(value) => value
@@ -392,6 +484,52 @@ mod tests {
                 "entry should be rejected: {entry}"
             );
         }
+    }
+
+    #[test]
+    fn status_pull_freshness_is_capped() {
+        assert_eq!(status_pull_freshness(0).unwrap(), Duration::ZERO);
+        assert_eq!(status_pull_freshness(15).unwrap(), Duration::from_secs(15));
+        assert_eq!(
+            status_pull_freshness(MAX_STATUS_PULL_FRESHNESS_SECONDS).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert!(status_pull_freshness(61).is_err());
+    }
+
+    #[test]
+    fn zero_pull_budgets_are_rejected() {
+        assert!(positive("FIAT_STATUS_PULL_RATE_BURST", 0).is_err());
+        assert_eq!(positive("FIAT_STATUS_PULL_RATE_BURST", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn checkout_lookup_concurrency_stays_below_the_store_pool() {
+        let pool = u64::from(crate::store::STORE_POOL_SIZE);
+        assert_eq!(checkout_lookup_concurrency(4).unwrap(), 4);
+        assert_eq!(checkout_lookup_concurrency(1).unwrap(), 1);
+        assert_eq!(
+            checkout_lookup_concurrency(pool - 1).unwrap(),
+            usize::try_from(pool - 1).unwrap()
+        );
+        assert!(checkout_lookup_concurrency(0).is_err());
+        assert!(checkout_lookup_concurrency(pool).is_err());
+        assert!(checkout_lookup_concurrency(pool + 1).is_err());
+    }
+
+    #[test]
+    fn checkout_lookup_wait_is_bounded() {
+        assert_eq!(
+            checkout_lookup_wait(2000).unwrap(),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(checkout_lookup_wait(1).unwrap(), Duration::from_millis(1));
+        assert_eq!(
+            checkout_lookup_wait(MAX_CHECKOUT_LOOKUP_WAIT_MS).unwrap(),
+            Duration::from_secs(10)
+        );
+        assert!(checkout_lookup_wait(0).is_err());
+        assert!(checkout_lookup_wait(MAX_CHECKOUT_LOOKUP_WAIT_MS + 1).is_err());
     }
 
     #[test]
